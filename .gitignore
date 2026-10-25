@@ -1,0 +1,23 @@
+# macOS
+.DS_Store
+
+# Office lock files (created while a .docx is open)
+~$*
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# Course materials: kept out of the code repo
+# (Jetson_Kria.docx, project.docx, 采购.docx, 实时字幕_项目计划_中英双语.md)
+documents/
+
+# Generated demo / self-test audio
+*.wav
+
+# Editor / OS
+.idea/
+.vscode/
