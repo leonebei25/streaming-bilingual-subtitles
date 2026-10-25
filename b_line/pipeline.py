@@ -1,16 +1,21 @@
-"""End-to-end orchestration: feeder -> VAD -> ASR -> segmenter -> MT -> events."""
+"""End-to-end orchestration: source -> VAD -> ASR -> segmenter -> MT -> events.
+
+The entry point takes a FrameSource (a stream), never a decoded buffer. The
+source decides what audio has actually arrived; the pipeline only processes what
+it is handed.
+"""
 from __future__ import annotations
 
 import time
-from typing import List, Optional, Tuple
+from typing import List
 
 import numpy as np
 
 from .asr import ASRBackend
 from .config import BLineConfig
-from .feeder import FrameFeeder
 from .mt import MTBackend
 from .segmenter import StablePrefixSegmenter
+from .sources import FrameSource
 from .types import AudioFrame, Gap, SubtitleEvent
 from .vad import EnergyVAD
 
@@ -36,8 +41,12 @@ class SubtitlePipeline:
     def processing_sec(self) -> float:
         return time.perf_counter() - self._proc0
 
-    def run(self, samples, sr, loss_windows=None, realtime=False, speed=1.0):
-        assert sr == self.cfg.sample_rate, f"expected {self.cfg.sample_rate} Hz, got {sr}"
+    def run(self, source: FrameSource) -> List[SubtitleEvent]:
+        """Consume a frame stream until the source reports it has ended.
+
+        The stream may be a live capture, a file replay or a synthetic signal;
+        the pipeline does not know or care which.
+        """
         self.events = []
         self.context = []
         self._chunk = []
@@ -45,23 +54,17 @@ class SubtitlePipeline:
         self.vad.reset()
         self.segmenter.reset()
 
-        feeder = FrameFeeder(samples, sr, self.cfg, loss_windows=loss_windows)
-        self.duration_sec = feeder.duration_sec
-        self._wall0 = time.monotonic()
+        self.duration_sec = source.duration_sec
         self._proc0 = time.perf_counter()
-        self._realtime = realtime
+        self._realtime = source.realtime
 
         while True:
-            if realtime:
-                feeder.release((time.monotonic() - self._wall0) * speed)
-            else:
-                feeder.release_all()
-            self._stream_clock = feeder.released_sec
-            items = feeder.drain()
+            items = source.take()
+            self._stream_clock = source.released_sec
             if not items:
-                if feeder.exhausted():
+                if source.ended():
                     break
-                if realtime:
+                if source.realtime:
                     time.sleep(0.004)
                     continue
                 break

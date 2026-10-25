@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
-"""Run the B-line pipeline on a WAV file (or a synthesized demo signal).
+"""Run the B-line on an audio stream.
+
+The pipeline never receives a whole buffer: it pulls frames from a FrameSource
+that releases audio only as it "arrives".
 
 Examples:
-  python run_pipeline.py --wav in.wav --script script.json --out events.json
-  python run_pipeline.py --wav in.wav --script script.json --loss 5.0-5.4 --realtime --speed 2
-  python run_pipeline.py --synth --loss 4.55-4.95          # self-contained demo
+  python run_pipeline.py --wav in.wav --script script.json
+  python run_pipeline.py --wav in.wav --script script.json --loss 5.0-5.4 --realtime
+  python run_pipeline.py --synth --loss 4.55-4.95
 """
 from __future__ import annotations
 
@@ -12,14 +15,12 @@ import argparse
 import json
 import time
 
-import numpy as np
-
-from b_line.audio import load_wav_mono16, save_wav_mono16, synthesize_test_audio
 from b_line.asr import ScriptedASR
 from b_line.config import BLineConfig
 from b_line.metrics import evaluate
 from b_line.mt import IdentityMT
 from b_line.pipeline import SubtitlePipeline
+from b_line.sources import SyntheticFrameSource, WavFrameSource
 
 # Demo transcript used by --synth
 DEMO_SCRIPT = [
@@ -51,46 +52,60 @@ def load_script(path):
     return entries, refs
 
 
+def build_source(args, cfg, loss):
+    """Return (source, script_entries, references) for the requested input."""
+    if args.synth:
+        utterances = [(t0, t1, 190.0 + 40.0 * i) for i, (t0, t1, _, _, _) in enumerate(DEMO_SCRIPT)]
+        src = SyntheticFrameSource(
+            cfg, utterances, DEMO_TOTAL,
+            loss_windows=loss, realtime=args.realtime, speed=args.speed, seed=7,
+        )
+        entries = [(t0, t1, en, conf) for (t0, t1, en, zh, conf) in DEMO_SCRIPT]
+        refs = [(t0, t1, en, zh) for (t0, t1, en, zh, conf) in DEMO_SCRIPT]
+        return src, entries, refs
+
+    if not args.wav:
+        raise SystemExit("provide --wav or --synth")
+    src = WavFrameSource(
+        args.wav, cfg,
+        loss_windows=loss, realtime=args.realtime, speed=args.speed,
+    )
+    if args.script:
+        entries, refs = load_script(args.script)
+    else:
+        entries, refs = [], None
+    return src, entries, refs
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--wav", help="input 16-bit PCM WAV")
-    ap.add_argument("--synth", action="store_true", help="synthesize a demo signal instead of --wav")
+    ap.add_argument("--wav", help="16 kHz mono/stereo 16-bit PCM WAV")
+    ap.add_argument("--synth", action="store_true", help="stream a synthetic demo signal instead of --wav")
     ap.add_argument("--script", help="transcript JSON for ScriptedASR (required unless --synth)")
     ap.add_argument("--out", help="write events+metrics JSON here")
     ap.add_argument("--loss", help="comma-separated t0-t1 loss windows, e.g. 5.0-5.4")
-    ap.add_argument("--realtime", action="store_true", help="replay at wall-clock rate (latency meaningful)")
+    ap.add_argument("--realtime", action="store_true", help="release audio at wall-clock rate")
     ap.add_argument("--speed", type=float, default=1.0, help="replay speed multiplier")
     ap.add_argument("--chunk-ms", type=float, default=320.0)
     ap.add_argument("--stability-ms", type=float, default=240.0)
     args = ap.parse_args(argv)
 
     max_seg = 60 if args.synth else 40
-    cfg = BLineConfig(chunk_ms=args.chunk_ms, stability_delay_ms=args.stability_ms, max_seg_chars=max_seg)
+    cfg = BLineConfig(
+        chunk_ms=args.chunk_ms,
+        stability_delay_ms=args.stability_ms,
+        max_seg_chars=max_seg,
+    )
 
-    if args.synth:
-        utterances = [(t0, t1, 190.0 + 40.0 * i) for i, (t0, t1, _, _, _) in enumerate(DEMO_SCRIPT)]
-        x = synthesize_test_audio(utterances, DEMO_TOTAL, sr=cfg.sample_rate, seed=7)
-        save_wav_mono16("sample.wav", x, cfg.sample_rate)
-        sr = cfg.sample_rate
-        entries = [(t0, t1, en, conf) for (t0, t1, en, zh, conf) in DEMO_SCRIPT]
-        refs = [(t0, t1, en, zh) for (t0, t1, en, zh, conf) in DEMO_SCRIPT]
-        print("wrote sample.wav (synthesized demo)")
-    else:
-        if not args.wav:
-            ap.error("provide --wav or --synth")
-        x, sr = load_wav_mono16(args.wav, cfg.sample_rate)
-        if args.script:
-            entries, refs = load_script(args.script)
-        else:
-            entries, refs = [], None
+    loss = parse_loss(args.loss)
+    source, entries, refs = build_source(args, cfg, loss)
 
     asr = ScriptedASR(entries, cfg)
     mt = IdentityMT()
     pipe = SubtitlePipeline(cfg, asr, mt)
 
     t0 = time.perf_counter()
-    events = pipe.run(x, sr, loss_windows=parse_loss(args.loss),
-                      realtime=args.realtime, speed=args.speed)
+    events = pipe.run(source)
     proc = time.perf_counter() - t0
 
     met = evaluate(events, references=refs, duration_sec=pipe.duration_sec,

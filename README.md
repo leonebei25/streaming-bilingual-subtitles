@@ -1,44 +1,63 @@
-# B-line: streaming ASR → segmentation → MT → subtitles (initial version)
+# B-line: streaming ASR → segmentation → MT → subtitles
 
 The recognition / translation half of the real-time bilingual subtitle project.
-This is a working skeleton: the whole data flow runs end-to-end right now using a
-deterministic "scripted" recognizer and an identity translator. The real Qwen3-ASR
-and translation backends are documented adapters that fail loudly until the GPU
-environment is configured.
+
+**The pipeline consumes a stream, never a buffer.** Its entry point takes a
+FrameSource, and a source hands out audio only up to a "released" horizon — i.e.
+only audio that has actually arrived. This is the manual's rule that the
+real-time branch must not access audio that has not yet arrived.
 
 ## Layout
 
     b_line/
       config.py      frozen configuration + snapshot hash
       types.py       data contracts (frames, gaps, segments, subtitle events)
-      audio.py       16 kHz mono I/O, resampling, STFT framing, test synthesis
-      feeder.py      FrameFeeder: releases audio only up to the arrived horizon
+      sources.py     FrameSource: WavFrameSource / SyntheticFrameSource / MicFrameSource
       vad.py         energy + zero-crossing VAD with hangover endpointing
       asr.py         ASR protocol, ScriptedASR (mock), Qwen3ASR (stub)
       segmenter.py   stable-prefix segmentation (endpoint + forced split + gap flush)
       mt.py          MT protocol, IdentityMT (mock), PretrainedMT (stub)
       metrics.py     WER, chrF, timing error, RTF, latency percentiles
       manifest.py    60/20/20 data split by speaker/source
-      pipeline.py    end-to-end orchestrator
+      pipeline.py    orchestration: source -> VAD -> ASR -> segmenter -> MT -> events
     run_pipeline.py  CLI driver
     selftest.py      end-to-end smoke test with assertions
     tests/           unit tests
 
+## The stream contract
+
+    class FrameSource:
+        take(max_items=512) -> list[AudioFrame | Gap]
+        ended() -> bool
+        duration_sec: float
+        released_sec: float        # how much of the stream has arrived
+
+Three implementations follow the manual's two input kinds:
+
+| source | manual wording | reads ahead? |
+|---|---|---|
+| WavFrameSource | "recordings replayed with their original timestamps" | no: one hop per read, zero samples on construction |
+| MicFrameSource | "a camera and microphone feed" | stub: device integration point |
+| SyntheticFrameSource | test / demo signal | no: generated hop by hop |
+
+WavFrameSource requires 16 kHz mono/stereo 16-bit PCM. Resampling belongs to the
+A-line, which owns capture and format normalisation.
+
 ## Quick start
 
-    # 1. run the self-test (also writes _selftest.wav)
+    # 1. self-test: synthetic stream, assertions, no files written
     python selftest.py
 
-    # 2. run the self-contained demo (synthesizes sample.wav)
+    # 2. CLI demo over a synthetic stream
     python run_pipeline.py --synth --loss 4.55-4.95
 
-    # 3. run on your own audio with a transcript
-    python run_pipeline.py --wav in.wav --script script.json --out events.json
+    # 3. real file, replayed at wall-clock rate
+    python run_pipeline.py --wav in.wav --script script.json --realtime
 
     # 4. unit tests
     python -m unittest discover -s tests -v
 
-The transcript JSON looks like:
+The transcript JSON used by the mock recognizer looks like:
 
     {
       "utterances": [
@@ -46,39 +65,34 @@ The transcript JSON looks like:
       ]
     }
 
-## The invariants this version enforces
+## Invariants enforced by the code
 
-1. The real-time branch never reads audio that has not arrived: FrameFeeder
-   only emits frames up to the released horizon.
-2. Packet loss leaves a hole: a loss window becomes a gap event, and audio is
-   never concatenated across it.
-3. Subtitle timing comes from the pipeline, not the recognizer: frames carry a
-   sequence number and sample offset; the segmenter attaches t_start / t_end.
-4. Recognition and translation are separate modules (a course requirement).
+1. **No reading ahead**: take() never returns an item past released_sec
+   (tested, including a realtime source).
+2. **Lazy reading**: constructing a WavFrameSource reads zero samples.
+3. **One gap per loss window**: a dropped interval becomes exactly one Gap, even
+   when the release horizon is still inside it — no fragmentation, and no
+   concatenation across the hole.
+4. **Timestamps come from the pipeline**: frames carry a sequence number and
+   sample offset, so t_start / t_end are frame-accurate, not chunk-aligned.
+5. **ASR and MT stay separate modules** (a course requirement), so the A/B/C
+   enhancement comparison can hold both fixed.
 
-## What is real vs. stubbed
+## Real vs. stubbed
 
-Real (works now):
-  - feeder / VAD / segmentation / orchestration / metrics / manifest / CLI
-  - ScriptedASR models the streaming behaviour: partial text grows, a prefix
-    stabilizes after a configurable delay
+Real: sources, VAD, segmentation, orchestration, metrics, manifest, CLI.
 
 Stubbed (fail loudly until configured):
-  - Qwen3ASR: needs the qwen-asr package + vLLM backend. Note that Qwen3-ASR
-    streaming is vLLM-only and does not return timestamps, so the pipeline
-    keeps its own chunk -> offset bookkeeping.
-  - PretrainedMT: needs a pretrained NMT / LLM with frozen weights, context
-    injection and terminology constraints.
-
-## Config freeze
-
-BLineConfig.freeze() returns a SHA-256 of the full configuration. Save it with
-every experiment run so model versions and decoding settings stay reproducible.
+  * Qwen3ASR — needs the qwen-asr package + a vLLM backend. Note that Qwen3-ASR
+    streaming is vLLM-only and returns no timestamps, so the pipeline keeps its
+    own chunk -> offset bookkeeping.
+  * PretrainedMT — needs a frozen pretrained NMT / LLM, context injection and
+    terminology constraints.
+  * MicFrameSource — needs a 16 kHz mono capture device (sounddevice).
 
 ## Next steps
 
-  - wire Qwen3ASR.reset() / stream() against the vLLM streaming client,
-  - implement PretrainedMT.translate() with context and terminology handling,
-  - add word-level timing for the renderer (optionally Qwen3-ForcedAligner
-    offline, labelled as such),
-  - build the 60/20/20 manifest from the collected clips.
+  * implement MicFrameSource.take() from a bounded capture queue,
+  * wire Qwen3ASR.reset() / stream() to the vLLM streaming client,
+  * implement PretrainedMT.translate() with context and terminology handling,
+  * build the 60/20/20 manifest from the collected clips.
