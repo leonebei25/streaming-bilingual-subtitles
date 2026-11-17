@@ -30,6 +30,7 @@ real-time branch must not access audio that has not yet arrived.
       video.py       burn subtitle events into an MP4
     run_pipeline.py  CLI driver
     scripts/desktop_smoke.py  A/B smoke run with events, metrics and video
+    tools/convert_wav.py      convert any PCM WAV to 16 kHz mono 16-bit
     selftest.py      end-to-end smoke test with assertions
     tests/           unit tests
 
@@ -59,6 +60,9 @@ A-line, which owns capture and format normalisation.
     # cmd.exe:  activate.bat
     # Git Bash: source ./activate.sh
 
+    # 0.5 convert a PCM WAV (44.1/48 kHz, stereo, ...) to 16 kHz mono
+    python tools/convert_wav.py video_test/vedio_1.wav
+
     # 1. self-test: synthetic stream, assertions, no files written
     python selftest.py
 
@@ -79,6 +83,27 @@ A-line, which owns capture and format normalisation.
         --asr sherpa --asr-model-dir models/sherpa-en \
         --mt opus --enhance spectral --link --link-loss 0.05 \
         --video-out out.mp4 --out run.json
+
+## Converting audio to 16 kHz
+
+The pipeline accepts only 16 kHz, 16-bit PCM WAV (mono or stereo). Use the
+converter for anything else:
+
+    python tools/convert_wav.py in.wav                  # -> in_16k.wav
+    python tools/convert_wav.py in.wav -o out.wav
+    python tools/convert_wav.py lecture_dir --out-dir lecture_16k --recursive
+    python tools/convert_wav.py in.wav --keep-stereo     # default downmixes to mono
+    python tools/convert_wav.py in.wav --normalize       # scale peak to 0.99
+
+It reads 8/16/24/32-bit PCM WAV, downmixes to mono by default, and resamples
+with `scipy.signal.resample_poly` (polyphase anti-aliasing, not naive
+decimation). The output is always 16-bit PCM. Float WAV is not supported by
+Python's `wave`; convert it with ffmpeg first. `scipy` is in
+`requirements-desktop.txt`.
+
+Each run prints a JSON summary with source/output rates, duration, resample
+ratio, peak before writing and the number of clipped samples; a non-zero exit
+code means at least one file failed.
 
 ## A/B/C switching
 
