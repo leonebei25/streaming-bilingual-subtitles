@@ -8,6 +8,7 @@
 # On Jetson, use NVIDIA's PyTorch wheel instead of this file's torch line.
 
 numpy>=1.24
+scipy>=1.10
 opencv-python>=4.8
 pillow>=9.5
 
