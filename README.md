@@ -54,6 +54,11 @@ A-line, which owns capture and format normalisation.
 
 ## Quick start
 
+    # 0. activate the virtual environment (PowerShell; the leading dot matters)
+    . .\activate.ps1
+    # cmd.exe:  activate.bat
+    # Git Bash: source ./activate.sh
+
     # 1. self-test: synthetic stream, assertions, no files written
     python selftest.py
 
