@@ -1,0 +1,23 @@
+# Desktop A/B pipeline dependencies.
+#
+# Install with:
+#   python -m pip install -r requirements-desktop.txt
+#
+# Torch: the default PyPI wheel is CPU-only on Windows. For a CUDA machine,
+# install the matching wheel from https://pytorch.org/get-started/locally/.
+# On Jetson, use NVIDIA's PyTorch wheel instead of this file's torch line.
+
+numpy>=1.24
+opencv-python>=4.8
+pillow>=9.5
+
+# Real streaming ASR (A/B chains). Download a streaming zipformer model
+# separately; the package is only the runtime.
+sherpa-onnx>=1.10,<3
+
+# Real translation backend (OpusMT / MarianMT). sentencepiece is required by
+# the Marian tokenizer. Skip these two lines if you only use IdentityMT.
+transformers>=4.40
+sentencepiece>=0.1.99
+sacremoses>=0.1.1
+torch>=2.2

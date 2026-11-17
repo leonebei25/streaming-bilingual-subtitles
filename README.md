@@ -14,13 +14,22 @@ real-time branch must not access audio that has not yet arrived.
       types.py       data contracts (frames, gaps, segments, subtitle events)
       sources.py     FrameSource: WavFrameSource / SyntheticFrameSource / MicFrameSource
       vad.py         energy + zero-crossing VAD with hangover endpointing
-      asr.py         ASR protocol, ScriptedASR (mock), Qwen3ASR (stub)
+      asr.py         ASR protocol, ScriptedASR (mock), SherpaASR (real), Qwen3ASR (stub)
       segmenter.py   stable-prefix segmentation (endpoint + forced split + gap flush)
-      mt.py          MT protocol, IdentityMT (mock), PretrainedMT (stub)
+      mt.py          MT protocol, IdentityMT (mock), OpusMT (real), PretrainedMT (stub)
       metrics.py     WER, chrF, timing error, RTF, latency percentiles
       manifest.py    60/20/20 data split by speaker/source
       pipeline.py    orchestration: source -> VAD -> ASR -> segmenter -> MT -> events
+    a_line/
+      link.py        packetization, 40 ms base delay, jitter, loss, jitter buffer
+      enhance/
+        base.py      Enhancer protocol: reset / process / algorithmic_delay_ms
+        bypass.py    A chain: no enhancement
+        spectral.py  B chain: causal spectral subtraction / Wiener
+        source.py    EnhancedFrameSource: blocks, enhances, re-emits original frames
+      video.py       burn subtitle events into an MP4
     run_pipeline.py  CLI driver
+    scripts/desktop_smoke.py  A/B smoke run with events, metrics and video
     selftest.py      end-to-end smoke test with assertions
     tests/           unit tests
 
@@ -57,6 +66,36 @@ A-line, which owns capture and format normalisation.
     # 4. unit tests
     python -m unittest discover -s tests -v
 
+    # 5. desktop A/B smoke: link -> enhancement -> ASR -> MT -> events -> MP4
+    python scripts/desktop_smoke.py --synth
+
+    # 6. real ASR + real MT on a WAV
+    python run_pipeline.py --wav in.wav --script script.json \
+        --asr sherpa --asr-model-dir models/sherpa-en \
+        --mt opus --enhance spectral --link --link-loss 0.05 \
+        --video-out out.mp4 --out run.json
+
+## A/B/C switching
+
+The three course pipelines share one code path; only `--enhance` changes:
+
+| chain | flag | what it does | training |
+|---|---|---|---|
+| A | `--enhance none` | pass received audio straight to ASR | none |
+| B | `--enhance spectral` | causal spectral subtraction, 25 ms / 10 ms | none |
+| B' | `--enhance wiener` | causal Wiener variant | none |
+| C | `--enhance dnn` (planned) | causal LSTM/TF-mask network | once, then frozen |
+
+`--link` applies the same packet loss / jitter trace to every chain when the
+seed is identical. Use `--link-loss 0.05 --link-jitter-ms 100
+--link-buffer-ms 120` for the course's stress condition, and
+`--link-burst 8.0-8.2` for the 200 ms burst.
+
+`a_line/enhance/source.py` buffers 320 ms blocks by default (`--enhance-block-ms`)
+so the STFT and the network see enough context. That block delay, the
+enhancer's own algorithmic delay (15 ms for the 25/10 spectral stage), the link
+playout delay, and the ASR lookahead must all be reported separately.
+
 The transcript JSON used by the mock recognizer looks like:
 
     {
@@ -77,22 +116,39 @@ The transcript JSON used by the mock recognizer looks like:
    sample offset, so t_start / t_end are frame-accurate, not chunk-aligned.
 5. **ASR and MT stay separate modules** (a course requirement), so the A/B/C
    enhancement comparison can hold both fixed.
+6. **A short gap is a hole, not a sentence boundary**: gaps shorter than
+   `gap_reset_ms` (default 500 ms) emit a gap event and flush the recogniser
+   chunk, but keep the VAD and segmenter state, so a 20 ms lost packet does not
+   shift every later subtitle.
 
 ## Real vs. stubbed
 
-Real: sources, VAD, segmentation, orchestration, metrics, manifest, CLI.
+Real: sources, VAD, segmentation, orchestration, metrics, manifest, CLI, link
+simulation, spectral/Wiener enhancement, subtitle video rendering, SherpaASR,
+OpusMT.
 
-Stubbed (fail loudly until configured):
+Stubbed (fail loudly until configured), or not implemented yet:
   * Qwen3ASR — needs the qwen-asr package + a vLLM backend. Note that Qwen3-ASR
     streaming is vLLM-only and returns no timestamps, so the pipeline keeps its
     own chunk -> offset bookkeeping.
-  * PretrainedMT — needs a frozen pretrained NMT / LLM, context injection and
-    terminology constraints.
+  * PretrainedMT — superseded by OpusMT for the desktop pipeline; kept as a
+    placeholder for a larger frozen NMT / LLM backend.
+  * The C-chain DNN enhancer (`--enhance dnn`) — the dataset, training script
+    and ONNX wrapper are the next piece of work.
   * MicFrameSource — needs a 16 kHz mono capture device (sounddevice).
+
+Desktop dependencies are in `requirements-desktop.txt`. The sherpa model is a
+separate download (e.g. `sherpa-onnx-streaming-zipformer-en-2023-06-26`) and the
+MarianMT weights are fetched by `transformers` or supplied as a local directory
+for offline use.
 
 ## Next steps
 
-  * implement MicFrameSource.take() from a bounded capture queue,
-  * wire Qwen3ASR.reset() / stream() to the vLLM streaming client,
-  * implement PretrainedMT.translate() with context and terminology handling,
-  * build the 60/20/20 manifest from the collected clips.
+  * C chain: `a_line/enhance/dataset.py`, `model.py`, `train.py`, `dnn.py`
+    (causal LSTM/TF-mask network, ONNX export, `--enhance dnn`),
+  * data: 60 clips / 30 min / 6 speakers, English transcripts + reviewed
+    Chinese references, DNS noise/RIR, 60/20/20 manifest,
+  * 10-minute continuous run with latency / buffer / loss display,
+  * MicFrameSource from a bounded capture queue (demo only; experiments replay WAV),
+  * optional: Qwen3ASR / a small LLM MT backend as an extension, not the main path,
+  * Jetson Orin Nano packaging: offline wheels, ONNX/TensorRT, 10-minute on-device run.

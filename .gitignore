@@ -18,6 +18,10 @@ documents/
 # Generated demo / self-test audio
 *.wav
 
+# Generated smoke runs (events, metrics, MP4)
+runs/
+*.mp4
+
 # Editor / OS
 .idea/
 .vscode/

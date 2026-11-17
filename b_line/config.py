@@ -30,6 +30,11 @@ class BLineConfig:
     vad_hangover_ms: float = 300.0   # trailing silence before an endpoint fires
     vad_init_frames: int = 50        # frames used to estimate the noise floor
 
+    # Packet-loss handling
+    # A short gap is a hole in the timeline, not the end of a sentence. Only a
+    # gap at least this long flushes the segment and resets the VAD.
+    gap_reset_ms: float = 500.0
+
     # Segmentation
     max_seg_chars: int = 40          # force a split when a segment grows past this
     max_seg_seconds: float = 6.0     # reserved; not enforced in the initial version

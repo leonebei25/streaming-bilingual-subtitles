@@ -8,6 +8,7 @@ integration and fails loudly until its environment is configured.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from pathlib import Path
 from typing import List, Optional, Tuple
 
 import numpy as np
@@ -78,6 +79,159 @@ class ScriptedASR(ASRBackend):
         self.covered_sec = float("inf")
         text, stable, conf = self._reveal()
         return ASRUpdate(text=text, stable_chars=stable, confidence=conf, finalized=True)
+
+
+def _common_prefix_len(a: str, b: str) -> int:
+    n = 0
+    for x, y in zip(a, b):
+        if x != y:
+            break
+        n += 1
+    return n
+
+
+def _join_text(left: str, right: str) -> str:
+    if left and right:
+        return f"{left} {right}".strip()
+    return (left or right).strip()
+
+
+class SherpaASR(ASRBackend):
+    """Streaming transducer ASR through sherpa-onnx.
+
+    Install ``sherpa-onnx`` and point ``model_dir`` at an extracted streaming
+    zipformer package (``tokens.txt`` plus encoder/decoder/joiner ONNX files).
+    The recognizer emits partial text for the current utterance; this adapter
+    keeps the cumulative contract expected by ``StablePrefixSegmenter``:
+    ``ASRUpdate.text`` is the whole session transcript and ``stable_chars``
+    covers finalized utterances plus the longest common prefix of the current
+    partial.
+
+    The stream is reset at sherpa's own endpoint. The pipeline's VAD still
+    decides when a segment ends; the two are allowed to fire independently.
+    """
+
+    def __init__(
+        self,
+        model_dir: Optional[str] = None,
+        tokens: Optional[str] = None,
+        encoder: Optional[str] = None,
+        decoder: Optional[str] = None,
+        joiner: Optional[str] = None,
+        cfg: Optional[BLineConfig] = None,
+        num_threads: int = 2,
+        decoding_method: str = "greedy_search",
+        provider: str = "cpu",
+        **backend_kwargs,
+    ):
+        try:
+            import sherpa_onnx
+        except ImportError as exc:  # pragma: no cover - depends on the machine
+            raise RuntimeError(
+                "SherpaASR needs the sherpa-onnx package. Install it with "
+                "`pip install sherpa-onnx` and download a streaming zipformer "
+                "model package (see https://github.com/k2-fsa/sherpa-onnx)."
+            ) from exc
+
+        self.cfg = cfg
+        self.sample_rate = int(getattr(cfg, "sample_rate", 16000))
+        paths = self._resolve_paths(model_dir, tokens, encoder, decoder, joiner)
+        self._rec = sherpa_onnx.OnlineRecognizer.from_transducer(
+            tokens=paths["tokens"],
+            encoder=paths["encoder"],
+            decoder=paths["decoder"],
+            joiner=paths["joiner"],
+            num_threads=int(num_threads),
+            sample_rate=self.sample_rate,
+            feature_dim=80,
+            decoding_method=decoding_method,
+            provider=provider,
+            **backend_kwargs,
+        )
+        self.reset()
+
+    @staticmethod
+    def _resolve_paths(model_dir, tokens, encoder, decoder, joiner) -> dict:
+        if model_dir:
+            root = Path(model_dir)
+
+            def pick(pattern: str, explicit: Optional[str]) -> str:
+                if explicit:
+                    return str(explicit)
+                matches = sorted(root.glob(pattern))
+                if not matches:
+                    raise FileNotFoundError(
+                        f"{root}: no file matching {pattern!r}; pass explicit paths "
+                        "or download a sherpa-onnx streaming model package"
+                    )
+                for match in matches:
+                    if "int8" not in match.name:
+                        return str(match)
+                return str(matches[0])
+
+            return {
+                "tokens": pick("tokens.txt", tokens),
+                "encoder": pick("encoder*.onnx", encoder),
+                "decoder": pick("decoder*.onnx", decoder),
+                "joiner": pick("joiner*.onnx", joiner),
+            }
+        if not all((tokens, encoder, decoder, joiner)):
+            raise ValueError(
+                "provide model_dir or all four paths: tokens, encoder, decoder, joiner"
+            )
+        return {
+            "tokens": str(tokens),
+            "encoder": str(encoder),
+            "decoder": str(decoder),
+            "joiner": str(joiner),
+        }
+
+    def reset(self) -> None:
+        self._stream = self._rec.create_stream()
+        self._session_text = ""
+        self._last_partial = ""
+
+    def _decode(self) -> str:
+        while self._rec.is_ready(self._stream):
+            self._rec.decode_stream(self._stream)
+        result = self._rec.get_result(self._stream)
+        # sherpa-onnx has returned both a plain string and a result object
+        # across versions; accept either.
+        if isinstance(result, str):
+            return result.strip()
+        return (getattr(result, "text", "") or "").strip()
+
+    def _update(self, finalized: bool) -> ASRUpdate:
+        current = self._decode()
+        if self._rec.is_endpoint(self._stream):
+            if current:
+                self._session_text = _join_text(self._session_text, current)
+            self._rec.reset(self._stream)
+            self._last_partial = ""
+            current = ""
+
+        text = _join_text(self._session_text, current)
+        stable = len(self._session_text)
+        if current:
+            if stable:
+                stable += 1
+            stable += _common_prefix_len(self._last_partial, current)
+        self._last_partial = current
+        return ASRUpdate(
+            text=text,
+            stable_chars=stable,
+            confidence=1.0,
+            finalized=finalized,
+        )
+
+    def stream(self, samples, start_sec: float, end_sec: float) -> ASRUpdate:
+        self._stream.accept_waveform(
+            self.sample_rate, np.asarray(samples, dtype=np.float32)
+        )
+        return self._update(finalized=False)
+
+    def finalize(self) -> ASRUpdate:
+        return self._update(finalized=True)
 
 
 class Qwen3ASR(ASRBackend):

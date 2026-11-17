@@ -76,16 +76,22 @@ class SubtitlePipeline:
 
     def _handle(self, it) -> None:
         if isinstance(it, Gap):
+            # Always flush the recognizer chunk: audio on the two sides of a
+            # hole must never be concatenated. A short hole, however, is not
+            # the end of the sentence -- keep the VAD and segmenter state so a
+            # 20 ms lost packet does not shift every later subtitle.
             self._flush_chunk(force=True)
-            self.segmenter.flush(it.start_sec)
-            for seg in self.segmenter.pop():
-                self._emit(seg)
+            gap_ms = max(0.0, it.end_sec - it.start_sec) * 1000.0
+            if gap_ms >= self.cfg.gap_reset_ms:
+                self.segmenter.flush(it.start_sec)
+                for seg in self.segmenter.pop():
+                    self._emit(seg)
+                self.vad.reset()
             self.events.append(SubtitleEvent(
                 seg_id=-1, t_start=it.start_sec, t_end=it.end_sec,
                 text_en="", text_zh="", conf_asr=0.0, conf_mt=0.0,
                 revision=0, gap_flag=True, emitted_at=self._emit_at(),
             ))
-            self.vad.reset()
             return
 
         frame: AudioFrame = it
