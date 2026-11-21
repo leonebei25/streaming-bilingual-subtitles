@@ -6,7 +6,7 @@ only audio that has actually arrived. This enforces the manual's rule that the
 real-time branch must not access audio that has not yet arrived.
 
 Mirroring the manual, a source is one of:
-  * a capture feed          -> MicFrameSource (stub: device integration point)
+  * a live push-fed feed   -> MicFrameSource / StreamingFrameSource (never preloaded)
   * a replay of a recording -> WavFrameSource (keeps the original timestamps)
   * a deterministic signal  -> SyntheticFrameSource (tests / demo, no file needed)
 
@@ -15,6 +15,9 @@ audio, so the receiver only ever operates on data it actually received.
 """
 from __future__ import annotations
 
+import collections
+import sys
+import threading
 import time
 import wave
 from abc import ABC, abstractmethod
@@ -26,6 +29,20 @@ from .config import BLineConfig
 from .types import AudioFrame, Gap
 
 Item = Union[AudioFrame, Gap]
+
+
+def _normalize_device(device):
+    """sounddevice selects by int index or by name substring; argparse gives str.
+
+    A bare number (``"10"``) must become the index ``10`` or sounddevice looks
+    for a device whose *name* contains "10". Names and None pass through.
+    """
+    if isinstance(device, str):
+        d = device.strip()
+        if d == "":
+            return None
+        return int(d) if d.lstrip("+-").isdigit() else d
+    return device
 
 
 class FrameSource(ABC):
@@ -243,23 +260,303 @@ class SyntheticFrameSource(PacedFrameSource):
         return y.astype(np.float32)
 
 
-class MicFrameSource(FrameSource):
-    """Live capture source (the manual's 'camera and microphone feed').
+class StreamingFrameSource(FrameSource):
+    """Push-fed, real-time frame source (microphone / pipe / network).
 
-    Integration point, deliberately left unimplemented so no hidden
-    whole-buffer path sneaks into the pipeline. To implement:
+    A producer -- a sounddevice callback, a socket reader thread, an ffmpeg
+    pipe -- hands raw mono audio to :meth:`push`; the pipeline pulls completed
+    hops from :meth:`take`. Only audio that has actually arrived is ever handed
+    out, and only a bounded window of it is buffered, so the whole stream is
+    never held in memory: this is the manual's native streaming input, not a
+    preloaded file.
 
-      * open the device at 16 kHz mono (sounddevice / soundcard),
-      * in the audio callback, append samples to a bounded queue with the
-        capture clock as timestamp,
-      * take() drains complete hops from that queue as AudioFrame items,
-      * ended() returns True when the caller signals stop.
+    If the consumer falls behind and the buffer would exceed ``max_buffer_sec``,
+    the oldest samples are dropped and reported as a :class:`Gap`, so the
+    receiver knows the timeline has a hole rather than silently stitching audio.
+
+    ``push`` is safe to call from any thread (the audio callback, a reader
+    thread). ``finish`` marks the stream ended; ``limit_sec > 0`` ends it
+    automatically once that much audio has arrived.
     """
 
-    def __init__(self, cfg: Optional[BLineConfig] = None, device: Optional[str] = None):
+    realtime = True
+
+    def __init__(self, cfg: BLineConfig, max_buffer_sec: float = 20.0,
+                 limit_sec: float = 0.0):
         self.cfg = cfg
+        self.sr = cfg.sample_rate
+        self.hop = cfg.hop_len
+        self._max_buffered = max(self.hop, int(max_buffer_sec * self.sr))
+        self._limit_sec = float(limit_sec)
+        self._lock = threading.Lock()
+        self._chunks: "collections.deque" = collections.deque()  # float32, oldest first
+        self._buffered = 0        # samples currently buffered
+        self._received = 0        # samples ever pushed
+        self._next = 0            # absolute index of the next sample to hand out
+        self._gaps: "collections.deque" = collections.deque()    # pending (start, end)
+        self._finished = False
+        self._seq = 0
+        self._dropped = 0
+
+    # -- producer side --------------------------------------------------
+    def push(self, data, sample_rate: Optional[int] = None,
+             channels: int = 1) -> None:
+        """Append mono audio at ``cfg.sample_rate``; int16 or float32 accepted."""
+        arr = np.asarray(data)
+        if arr.dtype == np.int16:
+            arr = arr.astype(np.float32) / 32768.0
+        elif arr.dtype != np.float32:
+            arr = arr.astype(np.float32)
+        if channels and int(channels) > 1:
+            arr = arr.reshape(-1, int(channels)).mean(axis=1)
+        arr = np.ascontiguousarray(arr.reshape(-1))
+        if sample_rate is not None and int(sample_rate) != self.sr:
+            raise ValueError(
+                f"stream sample rate {sample_rate} != {self.sr}; resample to "
+                f"{self.sr} Hz upstream -- the B-line takes a 16 kHz stream")
+        if arr.size == 0:
+            return
+        with self._lock:
+            self._chunks.append(arr)
+            self._buffered += arr.size
+            self._received += arr.size
+            # Bound memory. Dropping the oldest audio is reported as a gap so a
+            # slow consumer degrades to "lost audio", never "unbounded buffer".
+            while self._buffered > self._max_buffered and self._chunks:
+                need = self._buffered - self._max_buffered
+                oldest = self._chunks[0]
+                d = min(oldest.size, need)
+                if d >= oldest.size:
+                    self._chunks.popleft()
+                else:
+                    self._chunks[0] = oldest[d:]
+                self._buffered -= d
+                self._gaps.append((self._next / self.sr,
+                                   (self._next + d) / self.sr))
+                self._next += d
+                self._dropped += d
+            if self._limit_sec > 0 and self._received / self.sr >= self._limit_sec:
+                self._finished = True
+
+    def finish(self) -> None:
+        """Signal end of stream; buffered hops are still handed out first."""
+        with self._lock:
+            self._finished = True
+
+    @property
+    def dropped_samples(self) -> int:
+        return self._dropped
+
+    # -- consumer side --------------------------------------------------
+    @property
+    def duration_sec(self) -> float:
+        with self._lock:
+            return self._received / self.sr
+
+    @property
+    def released_sec(self) -> float:
+        with self._lock:
+            return self._received / self.sr
+
+    def ended(self) -> bool:
+        with self._lock:
+            return self._finished and self._buffered < self.hop
+
+    def _pop_front(self, n: int) -> np.ndarray:
+        """Remove exactly n leading samples (lock held by the caller)."""
+        parts, got = [], 0
+        while got < n and self._chunks:
+            c = self._chunks[0]
+            take = min(c.size, n - got)
+            parts.append(c[:take])
+            got += take
+            if take >= c.size:
+                self._chunks.popleft()
+            else:
+                self._chunks[0] = c[take:]
+        self._buffered -= got
+        if len(parts) == 1:
+            return parts[0]
+        return np.concatenate(parts)
+
+    def take(self, max_items: int = 512) -> List[Item]:
+        out: List[Item] = []
+        with self._lock:
+            while self._gaps and len(out) < max_items:
+                s, e = self._gaps.popleft()
+                out.append(Gap(s, e))
+            n_hops = min(self._buffered // self.hop, max_items - len(out))
+            for _ in range(n_hops):
+                block = self._pop_front(self.hop)
+                fs = self._next / self.sr
+                fe = (self._next + self.hop) / self.sr
+                out.append(AudioFrame(fs, fe, block, self._seq))
+                self._seq += 1
+                self._next += self.hop
+            # Trailing partial hop, only once the producer says it is done.
+            if self._finished and self._buffered > 0 and len(out) < max_items:
+                rem = self._buffered
+                block = self._pop_front(rem)
+                fs = self._next / self.sr
+                fe = (self._next + rem) / self.sr
+                out.append(AudioFrame(fs, fe, block, self._seq))
+                self._seq += 1
+                self._next += rem
+        return out
+
+
+class MicFrameSource(StreamingFrameSource):
+    """Live microphone capture through ``sounddevice``.
+
+    Opens the default (or a named/indexed) input device at 16 kHz mono and
+    pushes every callback block into the streaming buffer, so the pipeline
+    consumes the microphone in real time -- nothing is preloaded. If a device
+    (e.g. Stereo Mix, a mic array) only exposes its native rate, it is opened at
+    that rate and each block is resampled to 16 kHz automatically.
+
+    Stop with Ctrl+C or ``--max-seconds``. ``list_devices()`` prints choices.
+    """
+
+    def __init__(self, cfg: BLineConfig, device=None, max_buffer_sec: float = 20.0,
+                 limit_sec: float = 0.0, blocksize: int = 0,
+                 force_rate: Optional[int] = None,
+                 force_channels: Optional[int] = None):
+        super().__init__(cfg, max_buffer_sec=max_buffer_sec, limit_sec=limit_sec)
+        try:
+            import sounddevice as sd
+        except ImportError as exc:  # pragma: no cover - depends on the machine
+            raise RuntimeError(
+                "MicFrameSource needs sounddevice: `pip install sounddevice`"
+            ) from exc
+        # argparse hands the device in as a string, but sounddevice treats a
+        # string as a device-*name* substring. Turn a bare number into an index.
+        device = _normalize_device(device)
         self.device = device
-        raise RuntimeError(
-            "MicFrameSource is not implemented yet. Wire a 16 kHz mono capture "
-            "device here; the pipeline needs nothing else (take() + ended())."
-        )
+        self.capture_rate = cfg.sample_rate
+        self._channels = 1
+        self._resample = None
+
+        # Some inputs (Stereo Mix, mic arrays) reject mono or 16 kHz: a stereo
+        # device answers "Invalid number of channels" for 1 channel, and some
+        # only offer 44.1/48 kHz. Try the supported shapes in order and downmix /
+        # resample to 16 kHz mono internally.
+        try:
+            info = sd.query_devices(device, "input")
+            max_in = int(info["max_input_channels"])
+            native = int(round(float(info["default_samplerate"])))
+        except Exception:
+            max_in, native = 0, cfg.sample_rate
+        channel_opts = []
+        for c in ([force_channels] if force_channels else [1, 2, max_in]):
+            if c and c > 0 and c not in channel_opts:
+                channel_opts.append(c)
+        rate_opts = []
+        for r in ([force_rate] if force_rate else [cfg.sample_rate, native]):
+            if r and r > 0 and r not in rate_opts:
+                rate_opts.append(r)
+
+        last_exc = None
+        opened = False
+        attempts = []
+        for rate in rate_opts:
+            for ch in channel_opts:
+                attempts.append(f"{ch}ch@{rate}Hz")
+                try:
+                    raw = sd.RawInputStream(
+                        samplerate=rate, channels=ch, dtype="int16",
+                        blocksize=blocksize, device=device, callback=self._callback)
+                except Exception as exc:  # pragma: no cover - depends on the machine
+                    last_exc = exc
+                    continue
+                # Set the shape before start() so the first callback is correct.
+                self._channels = ch
+                self.capture_rate = rate
+                if rate != cfg.sample_rate:
+                    try:
+                        from math import gcd
+                        from scipy.signal import resample_poly
+                    except ImportError as exc:
+                        raw.close()
+                        raise RuntimeError(
+                            "this input only runs at a rate other than 16 kHz and "
+                            "resampling needs scipy: `pip install scipy`") from exc
+                    g = gcd(rate, cfg.sample_rate)
+                    self._resample = (resample_poly, cfg.sample_rate // g, rate // g)
+                try:
+                    raw.start()
+                except Exception as exc:  # pragma: no cover - depends on the machine
+                    last_exc = exc
+                    self._resample = None
+                    try:
+                        raw.close()
+                    except Exception:
+                        pass
+                    continue
+                self._raw = raw
+                opened = True
+                break
+            if opened:
+                break
+        if not opened:
+            raise RuntimeError(
+                f"could not open audio input {device!r}; tried "
+                f"{', '.join(attempts)}. Last error: {last_exc}. "
+                "'Invalid device' = disabled/busy/wrong host API; "
+                "'Invalid number of channels' = it needs another channel count. "
+                "Force a shape with --mic-channels / --mic-rate, or pick another "
+                "index from --mic-list.") from last_exc
+
+    def _callback(self, indata, frames, time_info, status):  # audio thread
+        x = np.frombuffer(bytes(indata), dtype=np.int16).astype(np.float32) / 32768.0
+        if self._channels > 1:
+            x = x.reshape(-1, self._channels).mean(axis=1)
+        if self._resample is not None:
+            fn, up, down = self._resample
+            x = fn(x, up, down).astype(np.float32, copy=False)
+        self.push(x)
+
+    def stop(self) -> None:
+        try:
+            self._raw.stop()
+            self._raw.close()
+        finally:
+            self.finish()
+
+    @staticmethod
+    def list_devices():
+        import sounddevice as sd
+        return sd.query_devices()
+
+
+class PcmStreamSource(StreamingFrameSource):
+    """Read 16 kHz mono signed-16 PCM from a binary stream (stdin / socket / pipe).
+
+    A daemon thread pulls raw little-endian int16 blocks and pushes them, so the
+    pipeline processes audio as it arrives. This is the same streaming contract
+    the microphone uses and lets you test the live path without a device, e.g.
+    feeding a socket, a named pipe, or ``ffmpeg ... -f s16le -`` on a platform
+    with true binary pipes.
+    """
+
+    def __init__(self, cfg: BLineConfig, stream=None, max_buffer_sec: float = 20.0,
+                 limit_sec: float = 0.0, read_bytes: int = 4096):
+        super().__init__(cfg, max_buffer_sec=max_buffer_sec, limit_sec=limit_sec)
+        self._stream = stream if stream is not None else sys.stdin.buffer
+        self._read_bytes = max(2, int(read_bytes))
+        self._thread = threading.Thread(target=self._pump, daemon=True)
+        self._thread.start()
+
+    def _pump(self) -> None:
+        try:
+            while True:
+                raw = self._stream.read(self._read_bytes)
+                if not raw:
+                    break
+                if len(raw) % 2:            # keep sample alignment across reads
+                    raw = raw[: len(raw) - 1]
+                self.push(np.frombuffer(raw, dtype=np.int16))
+        finally:
+            self.finish()
+
+    def stop(self) -> None:
+        self.finish()

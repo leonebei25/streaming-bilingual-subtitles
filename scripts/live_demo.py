@@ -49,12 +49,12 @@ from a_line.enhance import BypassEnhancer, SpectralSubtractionEnhancer
 from a_line.enhance.source import EnhancedFrameSource
 from a_line.link import LinkConfig, LinkSource
 from a_line.video import find_cjk_font
-from b_line.asr import ScriptedASR, SherpaASR
+from b_line.asr import ScriptedASR, SherpaASR, default_model_dir
 from b_line.config import BLineConfig
 from b_line.display import CJK_CPS, LATIN_CPS, CaptionQueue
 from b_line.mt import IdentityMT, OpusMT
 from b_line.pipeline import SubtitlePipeline
-from b_line.sources import WavFrameSource
+from b_line.sources import MicFrameSource, PcmStreamSource, WavFrameSource
 
 MIN_HOLD_S = 1.8
 MAX_HOLD_S = 6.5
@@ -191,24 +191,43 @@ def build_parser():
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    ap.add_argument("--video", required=True, help="video file to play")
+    ap.add_argument("--video", default=None,
+                    help="video file to play. Optional: with --mic / --pcm-stdin "
+                         "the demo shows a caption-only window (no video needed)")
+    ap.add_argument("--mic", action="store_true",
+                    help="caption a live microphone/loopback stream in real time")
+    ap.add_argument("--mic-device", default=None,
+                    help="input device index or name for --mic")
+    ap.add_argument("--mic-rate", type=int, default=0,
+                    help="force capture rate for --mic (0 = auto)")
+    ap.add_argument("--mic-channels", type=int, default=0,
+                    help="force capture channels for --mic (0 = auto)")
+    ap.add_argument("--pcm-stdin", action="store_true",
+                    help="caption 16 kHz mono signed-16 PCM read from stdin")
     ap.add_argument("--wav", help="16 kHz PCM WAV; extracted from --video with ffmpeg "
                                   "when omitted")
     ap.add_argument("--script", help="transcript JSON for --asr scripted")
 
     ap.add_argument("--asr", choices=["scripted", "sherpa"], default="sherpa")
-    ap.add_argument("--asr-model-dir")
+    ap.add_argument("--asr-model-dir",
+                    help="extracted streaming model; default: the Kroko 2025 "
+                         "English model under models/ when downloaded, else the "
+                         "legacy 2023 model")
     ap.add_argument("--asr-provider", default="cpu")
     ap.add_argument("--asr-threads", type=int, default=2)
+    ap.add_argument("--decoding-method", default="greedy_search",
+                    choices=["greedy_search", "modified_beam_search"],
+                    help="greedy (default) keeps up in real time; modified beam "
+                         "search is more accurate but slower (use when evaluating)")
     ap.add_argument("--no-endpoint", action="store_true",
                     help="disable sherpa's own endpoint detector (it is on by "
                          "default); sentences then come only from forced cuts")
     ap.add_argument("--rule1-ms", type=float, default=2400.0,
                     help="endpoint rule1: trailing silence that ends an "
                          "utterance even with no decoded speech (default 2400)")
-    ap.add_argument("--rule2-ms", type=float, default=1200.0,
+    ap.add_argument("--rule2-ms", type=float, default=2000.0,
                     help="endpoint rule2: trailing silence after decoded speech "
-                         "(default 1200); raise it if a breath splits a sentence")
+                         "(default 2000); raise it if a breath splits a sentence")
     ap.add_argument("--rule3-sec", type=float, default=20.0,
                     help="endpoint rule3: hard cap on one utterance (default 20 s)")
 
@@ -236,9 +255,9 @@ def build_parser():
                     help="consecutive runs that must agree on the cut (default 2)")
     ap.add_argument("--semantic-min-chars", type=int, default=24,
                     help="do not look for a cut below this draft size (default 24)")
-    ap.add_argument("--force-pause-ms", type=float, default=400.0,
+    ap.add_argument("--force-pause-ms", type=float, default=600.0,
                     help="when a draft must be forced, back off to the latest "
-                         "pause at least this long (default 400 ms)")
+                         "pause at least this long (default 600 ms)")
     ap.add_argument("--force-min-chars", type=int, default=20,
                     help="text that must precede a forced pause cut (default 20)")
     ap.add_argument("--no-rule-punct", action="store_true",
@@ -784,15 +803,21 @@ def main(argv=None):
     args = build_parser().parse_args(argv)
     if args.semantic_cuts and not args.punct_model:
         raise SystemExit("--semantic-cuts needs --punct-model <dir or model.onnx>")
-    if args.wav and not Path(args.wav).exists():
-        raise SystemExit(
-            f"--wav {args.wav} does not exist.\n"
-            f"Either omit --wav (the audio track is extracted from {args.video} "
-            "with ffmpeg), or create it once:\n"
-            f"  ffmpeg -y -i {args.video} -vn -ac 1 -ar 16000 -c:a pcm_s16le {args.wav}"
-        )
-    if not args.wav:
-        args.wav = extract_audio(args.video)
+    live_input = bool(args.mic or args.pcm_stdin)
+    if not live_input:
+        if not args.video:
+            raise SystemExit(
+                "provide --video to play a file, or --mic / --pcm-stdin for a "
+                "live caption window")
+        if args.wav and not Path(args.wav).exists():
+            raise SystemExit(
+                f"--wav {args.wav} does not exist.\n"
+                f"Either omit --wav (the audio track is extracted from {args.video} "
+                "with ffmpeg), or create it once:\n"
+                f"  ffmpeg -y -i {args.video} -vn -ac 1 -ar 16000 -c:a pcm_s16le {args.wav}"
+            )
+        if not args.wav:
+            args.wav = extract_audio(args.video)
     cfg = BLineConfig(
         chunk_ms=args.chunk_ms,
         stability_delay_ms=args.stability_ms,
@@ -823,14 +848,20 @@ def main(argv=None):
             raise SystemExit("--asr scripted needs --script for this demo")
         asr = ScriptedASR(entries, cfg)
     else:
-        if not args.asr_model_dir:
-            raise SystemExit("--asr sherpa requires --asr-model-dir")
+        model_dir = args.asr_model_dir or default_model_dir()
+        if not model_dir:
+            raise SystemExit(
+                "--asr sherpa needs --asr-model-dir (no model found under "
+                "models/; download "
+                "sherpa-onnx-streaming-zipformer-en-kroko-2025-08-06)")
         asr = SherpaASR(
-            model_dir=args.asr_model_dir,
+            model_dir=model_dir,
             cfg=cfg,
             num_threads=args.asr_threads,
             provider=args.asr_provider,
+            decoding_method=args.decoding_method,
         )
+        print(f"asr: {Path(model_dir).name} ({args.decoding_method})")
     asr = TimedASR(asr, quiet=not args.debug)
     if args.asr == "sherpa":
         print(f"endpoint: {'on' if cfg.enable_endpoint_detection else 'off'} "
@@ -858,7 +889,15 @@ def main(argv=None):
             sample_rate=cfg.sample_rate, method=args.enhance
         )
 
-    source = WavFrameSource(args.wav, cfg, realtime=True)
+    live_source = None
+    if args.mic:
+        source = live_source = MicFrameSource(
+            cfg, device=args.mic_device, force_rate=args.mic_rate or None,
+            force_channels=args.mic_channels or None, limit_sec=args.max_seconds)
+    elif args.pcm_stdin:
+        source = live_source = PcmStreamSource(cfg, limit_sec=args.max_seconds)
+    else:
+        source = WavFrameSource(args.wav, cfg, realtime=True)
     if args.link:
         source = LinkSource(
             source,
@@ -889,16 +928,21 @@ def main(argv=None):
     worker = threading.Thread(target=run_pipeline, daemon=True)
     worker.start()
 
-    cap = cv2.VideoCapture(args.video)
-    if not cap.isOpened():
-        raise SystemExit(f"cannot open video: {args.video}")
-    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 960
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 540
-    video_dur = (cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0.0) / fps
-    audio_dur = float(getattr(source, "duration_sec", 0.0) or 0.0)
-    if video_dur and audio_dur and abs(video_dur - audio_dur) > 1.0:
-        print(f"warning: video is {video_dur:.1f}s but audio is {audio_dur:.1f}s")
+    has_video = args.video is not None
+    cap = None
+    fps = 25.0
+    width, height = 960, 540
+    if has_video:
+        cap = cv2.VideoCapture(args.video)
+        if not cap.isOpened():
+            raise SystemExit(f"cannot open video: {args.video}")
+        fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 960
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 540
+        video_dur = (cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0.0) / fps
+        audio_dur = float(getattr(source, "duration_sec", 0.0) or 0.0)
+        if video_dur and audio_dur and abs(video_dur - audio_dur) > 1.0:
+            print(f"warning: video is {video_dur:.1f}s but audio is {audio_dur:.1f}s")
 
     font_path = find_cjk_font(args.font)
     # A transcript needs room: about 60% of the video height, within reason.
@@ -908,9 +952,10 @@ def main(argv=None):
         try:
             # WINDOW_AUTOSIZE (the imshow default) locks the window to the image
             # size; WINDOW_NORMAL lets the user drag it freely.
-            cv2.namedWindow("video", cv2.WINDOW_NORMAL)
+            if has_video:
+                cv2.namedWindow("video", cv2.WINDOW_NORMAL)
+                cv2.resizeWindow("video", width, height)
             cv2.namedWindow("transcript", cv2.WINDOW_NORMAL)
-            cv2.resizeWindow("video", width, height)
             cv2.resizeWindow("transcript", width, panel_h)
             # Wheel events arrive per window, so the panel owns the callback.
             cv2.setMouseCallback("transcript", panel.on_mouse)
@@ -919,7 +964,10 @@ def main(argv=None):
             args.headless = True
     if not args.headless and font_path is None:
         print("warning: no CJK font found; the transcript window will show English only")
-    print(f"video {width}x{height} @ {fps:.2f} fps, audio clock starts now")
+    if has_video:
+        print(f"video {width}x{height} @ {fps:.2f} fps, audio clock starts now")
+    else:
+        print(f"live caption window {width}x{panel_h}; press q/Esc to stop")
 
     captions = CaptionQueue(
         min_hold_s=args.min_hold_ms / 1000.0,
@@ -936,6 +984,7 @@ def main(argv=None):
     interrupted = False
     display = not args.headless
     last_debug = -1.0
+    frame = None
 
     while True:
         now = time.monotonic()
@@ -947,31 +996,41 @@ def main(argv=None):
             break
         if args.max_seconds and now - t0 >= args.max_seconds:
             break
-        if now < next_frame:
-            time.sleep(min(next_frame - now, 0.02))
+        if has_video:
+            if now < next_frame:
+                time.sleep(min(next_frame - now, 0.02))
+                if display:
+                    key_code = cv2.waitKey(1)
+                    if key_code in (27, ord("q")):
+                        interrupted = True
+                        break
+                    panel.handle_key(key_code)
+                continue
+
+            ok, frame = cap.read()
+            if not ok:
+                break
+            frame_idx += 1
+            next_frame = t0 + frame_idx / fps
+
+            # If decoding fell behind, drop frames instead of accumulating delay.
+            behind = (time.monotonic() - t0) * fps - frame_idx
+            while behind > 1.5:
+                ok, frame = cap.read()
+                if not ok:
+                    break
+                frame_idx += 1
+                next_frame = t0 + frame_idx / fps
+                behind -= 1
+        else:
+            # Live input: only captions to draw; pace by wall clock.
+            time.sleep(0.02)
             if display:
                 key_code = cv2.waitKey(1)
                 if key_code in (27, ord("q")):
                     interrupted = True
                     break
                 panel.handle_key(key_code)
-            continue
-
-        ok, frame = cap.read()
-        if not ok:
-            break
-        frame_idx += 1
-        next_frame = t0 + frame_idx / fps
-
-        # If decoding fell behind, drop frames instead of accumulating delay.
-        behind = (time.monotonic() - t0) * fps - frame_idx
-        while behind > 1.5:
-            ok, frame = cap.read()
-            if not ok:
-                break
-            frame_idx += 1
-            next_frame = t0 + frame_idx / fps
-            behind -= 1
 
         now_audio = time.monotonic() - t0
         events = pipe.events
@@ -1039,10 +1098,11 @@ def main(argv=None):
             image = panel.render(now_audio)
             try:
                 cv2.imshow("transcript", image)
-                cv2.putText(frame, f"t={now_audio:6.2f}s", (12, 28),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (230, 230, 230), 2,
-                            cv2.LINE_AA)
-                cv2.imshow("video", frame)
+                if has_video and frame is not None:
+                    cv2.putText(frame, f"t={now_audio:6.2f}s", (12, 28),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (230, 230, 230), 2,
+                                cv2.LINE_AA)
+                    cv2.imshow("video", frame)
                 key_code = cv2.waitKey(1)
             except cv2.error:
                 print("warning: this OpenCV build has no GUI backend; "
@@ -1053,7 +1113,7 @@ def main(argv=None):
                 interrupted = True
                 break
             panel.handle_key(key_code)
-            for name in ("video", "transcript"):
+            for name in (("video", "transcript") if has_video else ("transcript",)):
                 try:
                     if cv2.getWindowProperty(name, cv2.WND_PROP_VISIBLE) < 1:
                         interrupted = True
@@ -1064,7 +1124,16 @@ def main(argv=None):
             if interrupted:
                 break
 
-    cap.release()
+    if cap is not None:
+        cap.release()
+    # Stop a live capture so the worker's pipeline.run() can return.
+    if live_source is not None:
+        stop = getattr(live_source, "stop", None)
+        if stop:
+            try:
+                stop()
+            except Exception:
+                pass
     if display:
         try:
             cv2.destroyAllWindows()
@@ -1074,7 +1143,8 @@ def main(argv=None):
     worker.join(timeout=5.0)
     if failure:
         raise failure[0]
-    print(f"\nstopped after {frame_idx / fps:.1f}s of video, "
+    run_secs = time.monotonic() - t0
+    print(f"\nstopped after {run_secs:.1f}s, "
           f"{len(pipe.events)} events "
           f"({sum(1 for e in pipe.events if e.gap_flag)} gaps)"
           + (", interrupted" if interrupted else ""))

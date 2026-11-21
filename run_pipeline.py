@@ -27,12 +27,17 @@ from a_line.enhance import (
 from a_line.enhance.source import EnhancedFrameSource
 from a_line.link import LinkConfig, LinkSource
 from a_line.video import make_test_video, render_subtitles
-from b_line.asr import ScriptedASR, SherpaASR
+from b_line.asr import ScriptedASR, SherpaASR, default_model_dir
 from b_line.config import BLineConfig
 from b_line.metrics import evaluate
 from b_line.mt import IdentityMT, OpusMT
 from b_line.pipeline import SubtitlePipeline
-from b_line.sources import SyntheticFrameSource, WavFrameSource
+from b_line.sources import (
+    MicFrameSource,
+    PcmStreamSource,
+    SyntheticFrameSource,
+    WavFrameSource,
+)
 
 # Demo transcript used by --synth
 DEMO_SCRIPT = [
@@ -66,6 +71,34 @@ def load_script(path):
 
 def build_source(args, cfg, loss):
     """Return (source, script_entries, references) for the requested input."""
+    if args.mic_list:
+        try:
+            import sounddevice as sd
+            apis = sd.query_hostapis()
+            for i, d in enumerate(sd.query_devices()):
+                if d["max_input_channels"] <= 0:
+                    continue
+                api = apis[d["hostapi"]]["name"] if d["hostapi"] < len(apis) else "?"
+                try:
+                    rate = f"{float(d.get('default_samplerate', 0)):.0f} Hz"
+                except Exception:
+                    rate = "?"
+                print(f"{i:3d}  in={d['max_input_channels']}  {rate:>9}  "
+                      f"[{api}]  {d['name']}")
+        except Exception as exc:
+            raise SystemExit(f"cannot list audio devices: {exc}")
+        raise SystemExit(0)
+
+    # Native streaming inputs: audio arrives frame by frame at wall-clock rate,
+    # never preloaded. Both share MicFrameSource's streaming contract.
+    if args.mic:
+        return MicFrameSource(cfg, device=args.mic_device,
+                              force_rate=args.mic_rate or None,
+                              force_channels=args.mic_channels or None,
+                              limit_sec=args.max_seconds), [], None
+    if args.pcm_stdin:
+        return PcmStreamSource(cfg, limit_sec=args.max_seconds), [], None
+
     if args.synth:
         utterances = [(t0, t1, 190.0 + 40.0 * i) for i, (t0, t1, _, _, _) in enumerate(DEMO_SCRIPT)]
         src = SyntheticFrameSource(
@@ -77,7 +110,7 @@ def build_source(args, cfg, loss):
         return src, entries, refs
 
     if not args.wav:
-        raise SystemExit("provide --wav or --synth")
+        raise SystemExit("provide one of --wav, --synth, --mic or --pcm-stdin")
     src = WavFrameSource(
         args.wav, cfg,
         loss_windows=loss, realtime=args.realtime, speed=args.speed,
@@ -87,6 +120,46 @@ def build_source(args, cfg, loss):
     else:
         entries, refs = [], None
     return src, entries, refs
+
+
+def probe_mic(src, seconds: float) -> None:
+    """Record a few seconds from a live MicFrameSource, print the level, exit.
+
+    Uses the same device/channel/rate path as ``--mic``, so a silent reading
+    here means the device delivers silence (muted, blocked by Windows privacy,
+    or the wrong default input) -- not a pipeline bug.
+    """
+    import time
+    import numpy as np
+    try:
+        import sounddevice as sd
+        info = sd.query_devices(getattr(src, "device", None), "input")
+        print(f"mic probe: device={info['name']!r} "
+              f"channels={getattr(src, '_channels', '?')} rate={src.capture_rate}")
+    except Exception:
+        pass
+    t0 = time.monotonic()
+    blocks = []
+    try:
+        while time.monotonic() - t0 < seconds:
+            items = src.take()
+            if not items:
+                time.sleep(0.02)
+                continue
+            blocks += [it.data for it in items if hasattr(it, "data")]
+    finally:
+        stop = getattr(src, "stop", None)
+        if stop:
+            stop()
+    if not blocks:
+        print("mic probe: NO AUDIO arrived (0 frames)")
+        return
+    x = np.concatenate(blocks)
+    peak = float(np.abs(x).max())
+    rms = float(np.sqrt((x * x).mean()))
+    print(f"mic probe: {len(x) / src.sr:.1f}s peak={peak:.4f} rms={rms:.4f}")
+    print("  => SILENCE: fix Windows privacy / default input / mute"
+          if peak < 0.01 else "  => audio arriving OK")
 
 
 def build_enhancer(args, cfg: BLineConfig):
@@ -123,13 +196,18 @@ def build_asr(args, cfg: BLineConfig, entries):
             print("warning: ScriptedASR has no transcript; pass --script for real WAV input")
         return ScriptedASR(entries, cfg)
     if args.asr == "sherpa":
-        if not args.asr_model_dir:
-            raise SystemExit("--asr sherpa requires --asr-model-dir")
+        model_dir = args.asr_model_dir or default_model_dir()
+        if not model_dir:
+            raise SystemExit(
+                "--asr sherpa needs --asr-model-dir (no model found under "
+                "models/; download "
+                "sherpa-onnx-streaming-zipformer-en-kroko-2025-08-06)")
         return SherpaASR(
-            model_dir=args.asr_model_dir,
+            model_dir=model_dir,
             cfg=cfg,
             num_threads=args.asr_threads,
             provider=args.asr_provider,
+            decoding_method=args.decoding_method,
         )
     raise SystemExit(f"unknown ASR backend: {args.asr}")
 
@@ -148,8 +226,28 @@ def build_mt(args):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--wav", help="16 kHz mono/stereo 16-bit PCM WAV")
+    ap.add_argument("--wav", help="16 kHz mono/stereo 16-bit PCM WAV (file replay)")
     ap.add_argument("--synth", action="store_true", help="stream a synthetic demo signal instead of --wav")
+    ap.add_argument("--mic", action="store_true",
+                    help="capture the microphone in real time (native streaming input)")
+    ap.add_argument("--mic-device", default=None,
+                    help="input device index or name for --mic (see --mic-list)")
+    ap.add_argument("--mic-rate", type=int, default=0,
+                    help="force the capture sample rate for --mic (0 = auto: try "
+                         "16000 then the device default); resampled to 16 kHz")
+    ap.add_argument("--mic-channels", type=int, default=0,
+                    help="force the capture channel count for --mic (0 = auto: "
+                         "try 1, 2, then the device maximum); downmixed to mono")
+    ap.add_argument("--mic-probe", type=float, default=0.0,
+                    help="record N seconds from --mic, print the level, and exit "
+                         "(diagnose a silent/hollow capture)")
+    ap.add_argument("--mic-list", action="store_true",
+                    help="list audio devices and exit")
+    ap.add_argument("--pcm-stdin", action="store_true",
+                    help="read 16 kHz mono signed-16 PCM from stdin as a live stream")
+    ap.add_argument("--max-seconds", type=float, default=0.0,
+                    help="stop a live --mic/--pcm-stdin stream after N seconds "
+                         "(default 0 = run until Ctrl+C)")
     ap.add_argument("--script", help="transcript JSON for ScriptedASR (required unless --synth)")
     ap.add_argument("--out", help="write events+metrics JSON here")
     ap.add_argument("--loss", help="comma-separated t0-t1 loss windows, e.g. 5.0-5.4")
@@ -160,8 +258,9 @@ def main(argv=None):
     ap.add_argument("--max-seg-chars", type=int, default=0,
                     help="force a caption at this many draft characters "
                          "(default 0 = no character cap)")
-    ap.add_argument("--max-seg-seconds", type=float, default=6.0,
-                    help="force a caption once a draft has been growing this long")
+    ap.add_argument("--max-seg-seconds", type=float, default=15.0,
+                    help="force a caption once a draft has been growing this long "
+                         "(default 15 s; pass 6 for tighter latency evidence)")
     ap.add_argument("--sentence-gap-ms", type=float, default=800.0,
                     help="with --split-on-pauses: word gap that counts as a "
                          "sentence boundary")
@@ -186,18 +285,25 @@ def main(argv=None):
     ap.add_argument("--link-seed", type=int, default=0)
 
     ap.add_argument("--asr", choices=["scripted", "sherpa"], default="scripted")
-    ap.add_argument("--asr-model-dir", help="extracted sherpa-onnx streaming model")
+    ap.add_argument("--asr-model-dir",
+                    help="extracted streaming model; default: the Kroko 2025 "
+                         "English model under models/ when downloaded, else the "
+                         "legacy 2023 model")
     ap.add_argument("--asr-provider", default="cpu")
     ap.add_argument("--asr-threads", type=int, default=2)
+    ap.add_argument("--decoding-method", default="greedy_search",
+                    choices=["greedy_search", "modified_beam_search"],
+                    help="greedy (default) keeps up in real time; beam is more "
+                         "accurate but slower (use when evaluating)")
     ap.add_argument("--no-endpoint", action="store_true",
                     help="disable sherpa's endpoint detector (on by default); "
                          "captions then come only from forced cuts")
     ap.add_argument("--rule1-ms", type=float, default=2400.0,
                     help="endpoint rule1: trailing silence even with no decoded "
                          "speech (default 2400)")
-    ap.add_argument("--rule2-ms", type=float, default=1200.0,
+    ap.add_argument("--rule2-ms", type=float, default=2000.0,
                     help="endpoint rule2: trailing silence after decoded speech "
-                         "(default 1200)")
+                         "(default 2000)")
     ap.add_argument("--rule3-sec", type=float, default=20.0,
                     help="endpoint rule3: hard cap on one utterance (default 20 s)")
 
@@ -218,9 +324,9 @@ def main(argv=None):
                     help="consecutive runs that must agree on the cut (default 2)")
     ap.add_argument("--semantic-min-chars", type=int, default=24,
                     help="do not look for a cut below this draft size (default 24)")
-    ap.add_argument("--force-pause-ms", type=float, default=400.0,
+    ap.add_argument("--force-pause-ms", type=float, default=600.0,
                     help="when a draft must be forced, back off to the latest "
-                         "pause at least this long (default 400 ms)")
+                         "pause at least this long (default 600 ms)")
     ap.add_argument("--force-min-chars", type=int, default=20,
                     help="text that must precede a forced pause cut (default 20)")
 
@@ -234,6 +340,8 @@ def main(argv=None):
         raise SystemExit("--semantic-cuts needs --punct-model <dir or model.onnx>")
 
     if args.asr == "sherpa":
+        if not args.asr_model_dir:
+            args.asr_model_dir = default_model_dir()
         asr_snapshot = "sherpa:" + Path(args.asr_model_dir or "?").name
     else:
         asr_snapshot = "scripted"
@@ -261,6 +369,10 @@ def main(argv=None):
 
     loss = parse_loss(args.loss)
     source, entries, refs = build_source(args, cfg, loss)
+
+    if getattr(args, "mic_probe", 0.0) and isinstance(source, MicFrameSource):
+        probe_mic(source, args.mic_probe)
+        return
 
     link_cfg = build_link(args)
     if link_cfg is not None:
@@ -303,7 +415,8 @@ def main(argv=None):
     proc = time.perf_counter() - t0
 
     met = evaluate(events, references=refs, duration_sec=pipe.duration_sec,
-                   processing_sec=proc, realtime=args.realtime)
+                   processing_sec=proc,
+                   realtime=args.realtime or args.mic or args.pcm_stdin)
 
     video_stats = None
     if args.video_out:

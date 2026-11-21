@@ -136,6 +136,30 @@ def _tokens_to_words(tokens, timestamps):
     return words or None
 
 
+# Preferred streaming model directories under <repo>/models, best first.
+_PREFERRED_MODELS = (
+    "sherpa-onnx-streaming-zipformer-en-kroko-2025-08-06",
+    "sherpa-onnx-streaming-zipformer-en-2023-06-26",
+)
+
+
+def default_model_dir() -> Optional[str]:
+    """Return the best extracted streaming model under ``<repo>/models``.
+
+    Prefers the Kroko 2025 English model (trained on ~100k h of real audio,
+    far stronger on broadcast/news speech than the LibriSpeech-trained 2023
+    model) when it is downloaded, then falls back to the legacy 2023 package.
+    Returns None when neither exists, so callers can raise a clear error
+    instead of a confusing glob failure.
+    """
+    models = Path(__file__).resolve().parent.parent / "models"
+    for name in _PREFERRED_MODELS:
+        cand = models / name
+        if (cand / "tokens.txt").is_file():
+            return str(cand)
+    return None
+
+
 class SherpaASR(ASRBackend):
     """Streaming transducer ASR through sherpa-onnx.
 
