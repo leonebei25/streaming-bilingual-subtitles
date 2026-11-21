@@ -25,6 +25,18 @@ class BLineConfig:
                                       # text stops being rewritten (becomes "stable")
     asr_model: str = "scripted"      # "scripted" | "qwen3-0.6b" | "qwen3-1.7b"
 
+    # Endpoint detection (the sentence-boundary source for sherpa)
+    # sherpa-onnx's factory default is False. With it off, is_endpoint() always
+    # returns False, stable_chars never grows, and every caption is a forced
+    # 10 s / 160-character cut instead of a sentence. Keep it on for sherpa.
+    enable_endpoint_detection: bool = True
+    # rule1: trailing silence that ends an utterance even when nothing was
+    # decoded (a quiet room). rule2: trailing silence after decoded speech --
+    # the normal trigger. rule3: hard cap on the length of one utterance.
+    rule1_min_trailing_silence: float = 2.4
+    rule2_min_trailing_silence: float = 1.2
+    rule3_min_utterance_length: float = 20.0
+
     # VAD / endpointing
     # The VAD no longer decides sentence boundaries -- the ASR endpoint does
     # (sherpa's is language-model based and waits ~1.2 s of silence). The VAD
@@ -48,13 +60,32 @@ class BLineConfig:
     # segmenter does not cut finalized sentences itself; these two values are
     # documented targets for how long a single caption should be. To tighten a
     # long sentence, tune sherpa's endpoint rules, not a post-hoc character cap.
-    max_seg_chars: int = 160         # three display lines; a forced commit waits
-                                     # for a real sentence, not a 100-char slice
-    max_seg_seconds: float = 10.0    # a draft older than this is force-finalized;
+    max_seg_chars: int = 0           # 0 = no character cap; a draft is bounded by
+                                     # max_seg_seconds and sherpa's rule3 instead
+    max_seg_seconds: float = 15.0    # a draft older than this is force-finalized;
                                      # long enough to keep a whole sentence together
+                                     # (still below sherpa's 20 s rule3)
     sentence_gap_ms: float = 800.0   # word gap that counts as a sentence boundary;
                                      # short pauses stay inside one caption
     sentence_min_chars: int = 60     # a caption shorter than this is not worth a cut
+    # One draft run on screen is one caption: whichever boundary ends the draft
+    # (the ASR endpoint or a forced commit) is the only splitter. Set this to
+    # True to re-enable cutting a committed slice at the pauses inside it.
+    split_on_pauses: bool = False
+
+    # Semantic cuts: ask a punctuation model where sentences end inside the
+    # draft and commit a confirmed boundary early. Needs --punct-model.
+    semantic_cuts: bool = False
+    semantic_lookahead_words: int = 8   # never cut this close to the live edge
+    semantic_confirm: int = 2           # same offset on this many runs
+    semantic_step_chars: int = 8        # re-run after the draft grows this much
+    semantic_step_sec: float = 0.32     # ... or after this long
+    semantic_min_chars: int = 24        # do not bother below this size
+
+    # Forced commits back off to a real pause instead of cutting wherever the
+    # draft happens to end. A pause shorter than this is not worth a cut.
+    force_pause_ms: float = 400.0
+    force_min_chars: int = 20           # text that must precede the pause
 
     # Rule-based punctuation, for when no punctuation model is configured: a
     # full stop at the end of every committed sentence, nothing else. Commas

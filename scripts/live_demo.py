@@ -200,15 +200,47 @@ def build_parser():
     ap.add_argument("--asr-model-dir")
     ap.add_argument("--asr-provider", default="cpu")
     ap.add_argument("--asr-threads", type=int, default=2)
+    ap.add_argument("--no-endpoint", action="store_true",
+                    help="disable sherpa's own endpoint detector (it is on by "
+                         "default); sentences then come only from forced cuts")
+    ap.add_argument("--rule1-ms", type=float, default=2400.0,
+                    help="endpoint rule1: trailing silence that ends an "
+                         "utterance even with no decoded speech (default 2400)")
+    ap.add_argument("--rule2-ms", type=float, default=1200.0,
+                    help="endpoint rule2: trailing silence after decoded speech "
+                         "(default 1200); raise it if a breath splits a sentence")
+    ap.add_argument("--rule3-sec", type=float, default=20.0,
+                    help="endpoint rule3: hard cap on one utterance (default 20 s)")
 
-    ap.add_argument("--mt", choices=["none", "identity", "opus"], default="none",
-                    help="none = English-only transcript (default)")
-    ap.add_argument("--mt-model", default="Helsinki-NLP/opus-mt-en-zh")
+    ap.add_argument("--mt", choices=["auto", "none", "identity", "opus"],
+                    default="auto",
+                    help="auto (default) = opus when models/opus-mt-en-zh exists, "
+                         "else English-only; none = English-only; identity = no "
+                         "translation text")
+    ap.add_argument("--mt-model", default=None,
+                    help="local model directory or hub id (default: "
+                         "models/opus-mt-en-zh when present, else "
+                         "Helsinki-NLP/opus-mt-en-zh)")
     ap.add_argument("--mt-device", default=None)
     ap.add_argument("--mt-context", action="store_true")
     ap.add_argument("--punct-model", default="",
-                    help="sherpa-onnx punctuation model (model.onnx); restores "
-                         ",.?! so captions break at real sentence boundaries")
+                    help="punctuation model: a directory or a .onnx file. A dir "
+                         "containing bpe.vocab uses the online English CNN-BiLSTM; "
+                         "anything else uses the offline zh+en CT-Transformer")
+    ap.add_argument("--semantic-cuts", action="store_true",
+                    help="commit a caption as soon as a stable sentence end appears "
+                         "inside the draft (needs --punct-model)")
+    ap.add_argument("--semantic-lookahead", type=int, default=8,
+                    help="words that must remain after a candidate cut (default 8)")
+    ap.add_argument("--semantic-confirm", type=int, default=2,
+                    help="consecutive runs that must agree on the cut (default 2)")
+    ap.add_argument("--semantic-min-chars", type=int, default=24,
+                    help="do not look for a cut below this draft size (default 24)")
+    ap.add_argument("--force-pause-ms", type=float, default=400.0,
+                    help="when a draft must be forced, back off to the latest "
+                         "pause at least this long (default 400 ms)")
+    ap.add_argument("--force-min-chars", type=int, default=20,
+                    help="text that must precede a forced pause cut (default 20)")
     ap.add_argument("--no-rule-punct", action="store_true",
                     help="leave the ASR text exactly as emitted: no sentence-end "
                          "full stop either")
@@ -239,21 +271,27 @@ def build_parser():
     ap.add_argument("--vad-zcr", type=float, default=0.4)
     ap.add_argument("--chunk-ms", type=float, default=160.0)
     ap.add_argument("--stability-ms", type=float, default=120.0)
-    ap.add_argument("--max-seg-chars", type=int, default=160,
-                    help="only force a caption at this length (default 160, about "
-                         "three lines); the recognizer's own endpoint should end "
-                         "sentences first")
-    ap.add_argument("--max-seg-seconds", type=float, default=10.0,
+    ap.add_argument("--max-seg-chars", type=int, default=0,
+                    help="force a caption once a draft reaches this many characters "
+                         "(default 0 = no character cap); length is then bounded by "
+                         "--max-seg-seconds and sherpa's rule3")
+    ap.add_argument("--max-seg-seconds", type=float, default=15.0,
                     help="force a caption once a draft has been growing this long "
-                         "(default 10 s); longer keeps a sentence together")
+                         "(default 15 s); longer keeps a sentence together")
     ap.add_argument("--roll-chars", type=int, default=ROLL_CHARS,
                     help="characters of the unfinished sentence kept visible in the "
-                         "live line before the oldest words scroll off (default 240)")
+                         "live line before the oldest words scroll off (default 240; "
+                         "0 = keep all of it)")
     ap.add_argument("--sentence-gap-ms", type=float, default=800.0,
-                    help="word gap that counts as a sentence boundary "
-                         "(default 800 ms; shorter pauses stay inside one caption)")
+                    help="with --split-on-pauses: word gap that counts as a "
+                         "sentence boundary (default 800 ms)")
     ap.add_argument("--sentence-min-chars", type=int, default=60,
-                    help="shortest caption worth cutting at a pause (default 60)")
+                    help="with --split-on-pauses: shortest caption worth "
+                         "cutting at a pause (default 60)")
+    ap.add_argument("--split-on-pauses", action="store_true",
+                    help="cut a committed draft at the pauses inside it, so one "
+                         "caption may hold fewer words than the draft line showed; "
+                         "off by default: one draft run = one caption")
     ap.add_argument("--min-hold-ms", type=float, default=MIN_HOLD_S * 1000.0,
                     help="a caption stays at least this long, even if short")
     ap.add_argument("--max-hold-ms", type=float, default=MAX_HOLD_S * 1000.0,
@@ -283,7 +321,7 @@ def rolling_text(settled: str, live: str, limit: int = 100) -> str:
     settled = (settled or "").strip()
     live = (live or "").strip()
     text = f"{settled} {live}".strip() if settled else live
-    if len(text) <= limit:
+    if limit <= 0 or len(text) <= limit:
         return text
     tail = text[-limit:]
     sp = tail.find(" ")
@@ -695,20 +733,57 @@ class NullMT:
         return "", 1.0
 
 
+def _local_mt_dir() -> Path:
+    """models/opus-mt-en-zh next to the repository, independent of the cwd."""
+    return Path(__file__).resolve().parent.parent / "models" / "opus-mt-en-zh"
+
+
 def build_mt(args):
-    if args.mt == "none":
+    choice = args.mt
+    model = args.mt_model
+
+    if choice == "auto":
+        local = _local_mt_dir()
+        if model or local.is_dir():
+            choice = "opus"
+            model = model or str(local)
+        else:
+            print("translation: off -- no local model at models/opus-mt-en-zh; "
+                  "the Chinese line needs --mt opus --mt-model <dir>")
+            return NullMT()
+
+    if choice == "none":
+        print("translation: off -- the transcript will be English-only")
         return NullMT()
-    if args.mt == "identity":
+    if choice == "identity":
+        print("translation: identity -- no Chinese text will be produced")
         return IdentityMT()
-    return OpusMT(
-        model_name=args.mt_model,
-        device=args.mt_device,
-        use_context=args.mt_context,
-    )
+
+    model = model or "Helsinki-NLP/opus-mt-en-zh"
+    try:
+        mt = OpusMT(
+            model_name=model,
+            device=args.mt_device,
+            use_context=args.mt_context,
+        )
+    except Exception as exc:
+        print(f"translation: off -- OpusMT could not load ({exc}). "
+              "The transcript will be English-only.")
+        return NullMT()
+
+    device = getattr(mt, "_device", "?")
+    print(f"translation: opus {model} on {device}; each finalized English "
+          "line gets its Chinese translation underneath")
+    if device == "cpu":
+        print("  note: translating on CPU blocks the pipeline for the length of "
+              "each sentence; use --mt-device cuda when torch has CUDA")
+    return mt
 
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
+    if args.semantic_cuts and not args.punct_model:
+        raise SystemExit("--semantic-cuts needs --punct-model <dir or model.onnx>")
     if args.wav and not Path(args.wav).exists():
         raise SystemExit(
             f"--wav {args.wav} does not exist.\n"
@@ -728,6 +803,17 @@ def main(argv=None):
         max_seg_seconds=args.max_seg_seconds,
         sentence_gap_ms=args.sentence_gap_ms,
         sentence_min_chars=args.sentence_min_chars,
+        split_on_pauses=args.split_on_pauses,
+        semantic_cuts=args.semantic_cuts,
+        semantic_lookahead_words=args.semantic_lookahead,
+        semantic_confirm=args.semantic_confirm,
+        semantic_min_chars=args.semantic_min_chars,
+        force_pause_ms=args.force_pause_ms,
+        force_min_chars=args.force_min_chars,
+        enable_endpoint_detection=not args.no_endpoint,
+        rule1_min_trailing_silence=args.rule1_ms / 1000.0,
+        rule2_min_trailing_silence=args.rule2_ms / 1000.0,
+        rule3_min_utterance_length=args.rule3_sec,
     )
 
     # Models first: the source starts the wall clock when it is constructed.
@@ -746,12 +832,20 @@ def main(argv=None):
             provider=args.asr_provider,
         )
     asr = TimedASR(asr, quiet=not args.debug)
+    if args.asr == "sherpa":
+        print(f"endpoint: {'on' if cfg.enable_endpoint_detection else 'off'} "
+              f"(rule1 {cfg.rule1_min_trailing_silence * 1000:.0f} ms, "
+              f"rule2 {cfg.rule2_min_trailing_silence * 1000:.0f} ms, "
+              f"rule3 {cfg.rule3_min_utterance_length:.0f} s)")
     mt = build_mt(args)
     punct = None
     if args.punct_model:
         from b_line.punct import PunctRestorer
         punct = PunctRestorer(args.punct_model)
-        cfg.punct_model = Path(punct.model_path).name
+        cfg.punct_model = punct.describe()
+    if args.semantic_cuts:
+        print(f"semantic cuts: on (lookahead {cfg.semantic_lookahead_words} words, "
+              f"confirm {cfg.semantic_confirm}, min {cfg.semantic_min_chars} chars)")
     # The recognizer emits no punctuation. With no punctuation model installed,
     # each committed sentence gets a full stop and nothing else -- commas
     # guessed from pauses read as wrong. Install --punct-model for real marks.
@@ -905,7 +999,11 @@ def main(argv=None):
             last_debug = now_audio
             if current is None:
                 print(f"[dbg] t={now_audio:6.2f}s events={len(events)} "
-                      f"vad_speech={pipe.vad.speech} seg_start={pipe.vad.seg_start} last=none")
+                      f"vad_speech={pipe.vad.speech} seg_start={pipe.vad.seg_start} "
+                      f"last=none ep={getattr(pipe.asr, 'endpoint_count', 0)} "
+                      f"forced={getattr(pipe.asr, 'force_count', 0)} "
+                      f"cuts={getattr(pipe, 'semantic_cut_count', 0)} "
+                      f"pcuts={getattr(pipe, 'pause_cut_count', 0)}")
             else:
                 print(f"[dbg] t={now_audio:6.2f}s events={len(events)} "
                       f"vad_speech={pipe.vad.speech} seg_start={pipe.vad.seg_start} "
@@ -914,6 +1012,10 @@ def main(argv=None):
                       f"hold={captions.remaining(now_audio):.2f}s "
                       f"queued={captions.pending_count} "
                       f"words={'yes' if getattr(pipe, 'words_available', False) else 'NO'} "
+                      f"ep={getattr(pipe.asr, 'endpoint_count', 0)} "
+                      f"forced={getattr(pipe.asr, 'force_count', 0)} "
+                      f"cuts={getattr(pipe, 'semantic_cut_count', 0)} "
+                      f"pcuts={getattr(pipe, 'pause_cut_count', 0)} "
                       f"draft={len(getattr(pipe, 'live_text', '') or '')}")
 
         if display:
@@ -976,6 +1078,12 @@ def main(argv=None):
           f"{len(pipe.events)} events "
           f"({sum(1 for e in pipe.events if e.gap_flag)} gaps)"
           + (", interrupted" if interrupted else ""))
+    if args.asr == "sherpa":
+        print(f"endpoints={getattr(pipe.asr, 'endpoint_count', 0)} "
+              f"forced={getattr(pipe.asr, 'force_count', 0)} "
+              f"streams={getattr(pipe.asr, 'stream_count', 0)} "
+              f"semantic_cuts={getattr(pipe, 'semantic_cut_count', 0)} "
+              f"pause_cuts={getattr(pipe, 'pause_cut_count', 0)}")
     return 0
 
 

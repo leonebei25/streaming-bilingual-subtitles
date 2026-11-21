@@ -52,8 +52,20 @@ class TestSplitSentences(unittest.TestCase):
 
 
 class TestPipelineSentenceEvents(unittest.TestCase):
-    def test_one_slice_becomes_one_event_per_sentence(self):
+    def test_slice_is_one_event_by_default(self):
         cfg = BLineConfig()
+        pipe = SubtitlePipeline(cfg, ScriptedASR([], cfg), IdentityMT())
+        pipe._emit(Segment(0, 0.0, 4.0, "First sentence. Second sentence.", 1.0))
+
+        self.assertEqual(len(pipe.events), 1,
+                         "one draft run on screen must become one caption")
+        event = pipe.events[0]
+        self.assertEqual(event.text_en, "First sentence. Second sentence.")
+        self.assertAlmostEqual(event.t_start, 0.0)
+        self.assertAlmostEqual(event.t_end, 4.0)
+
+    def test_split_on_pauses_emits_one_event_per_sentence(self):
+        cfg = BLineConfig(split_on_pauses=True)
         pipe = SubtitlePipeline(cfg, ScriptedASR([], cfg), IdentityMT())
         pipe._emit(Segment(0, 0.0, 4.0, "First sentence. Second sentence.", 1.0))
 

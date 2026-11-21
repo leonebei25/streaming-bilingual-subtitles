@@ -27,7 +27,8 @@ class TestTokensToWords(unittest.TestCase):
 
 class TestWordGapSegmentation(unittest.TestCase):
     def _run(self, words, gap_ms=550, min_chars=25):
-        cfg = BLineConfig(sentence_gap_ms=gap_ms, sentence_min_chars=min_chars)
+        cfg = BLineConfig(sentence_gap_ms=gap_ms, sentence_min_chars=min_chars,
+                          split_on_pauses=True)
         seg = StablePrefixSegmenter(cfg)
         seg.note_speech(True, 0.0, 0.0)
         text = " ".join(w for w, _ in words)
@@ -56,7 +57,8 @@ class TestWordGapSegmentation(unittest.TestCase):
     def test_length_cut_prefers_the_largest_pause(self):
         # every gap is below the gap threshold, so the length cap decides; the
         # cut must land on the widest pause inside the group
-        cfg = BLineConfig(sentence_gap_ms=300, max_seg_chars=60, sentence_min_chars=18)
+        cfg = BLineConfig(sentence_gap_ms=300, max_seg_chars=60,
+                          sentence_min_chars=18, split_on_pauses=True)
         seg = StablePrefixSegmenter(cfg)
         seg.note_speech(True, 0.0, 0.0)
         A, B, C, D, E = ("A" * 12, "B" * 12, "C" * 12, "D" * 12, "E" * 12)
@@ -67,6 +69,17 @@ class TestWordGapSegmentation(unittest.TestCase):
         out = seg.pop()
         self.assertEqual([s.text_en for s in out],
                          [f"{A} {B}", f"{C} {D} {E}"])
+
+    def test_zero_max_chars_disables_the_length_cut(self):
+        cfg = BLineConfig(sentence_gap_ms=300, max_seg_chars=0,
+                          sentence_min_chars=18, split_on_pauses=True)
+        seg = StablePrefixSegmenter(cfg)
+        seg.note_speech(True, 0.0, 0.0)
+        words = [(W, 0.1 * i) for i, W in enumerate(["A" * 40] * 4)]
+        text = " ".join(w for w, _ in words)
+        seg.update(ASRUpdate(text=text, stable_chars=len(text), confidence=1.0,
+                             words=words), words[-1][1])
+        self.assertEqual([s.text_en for s in seg.pop()], [text])
 
     def test_misaligned_words_fall_back_to_one_segment(self):
         words = [("WE", 0.2), ("WILL", 0.4), ("NOW", 0.6), ("DISCUSS", 0.8),
@@ -82,12 +95,28 @@ class TestWordGapSegmentation(unittest.TestCase):
         self.assertEqual(out[0].text_en, text)
 
 
+class TestDefaultCommit(unittest.TestCase):
+    """The on-screen draft and the committed caption must have the same words."""
+
+    def test_pause_inside_a_finalized_slice_does_not_split_it(self):
+        words = [("SIGNAL", 0.2), ("INTO", 0.4), ("SINUSOIDS", 0.6), ("AND", 0.8),
+                 ("THE", 1.8), ("SAMPLING", 2.0), ("THEOREM", 2.2)]
+        cfg = BLineConfig(sentence_gap_ms=550, sentence_min_chars=25)
+        seg = StablePrefixSegmenter(cfg)
+        seg.note_speech(True, 0.0, 0.0)
+        text = " ".join(w for w, _ in words)
+        seg.update(ASRUpdate(text=text, stable_chars=len(text), confidence=1.0,
+                             words=words), words[-1][1])
+        self.assertEqual([s.text_en for s in seg.pop()], [text])
+
+
 class TestRulePunctuation(unittest.TestCase):
     """The recognizer emits no marks; the segmenter derives them from pauses."""
 
     def _commit(self, words, **kw):
         cfg = BLineConfig(rule_punctuation=True, sentence_gap_ms=800,
-                          sentence_min_chars=18, max_seg_chars=160, **kw)
+                          sentence_min_chars=18, max_seg_chars=160,
+                          split_on_pauses=True, **kw)
         seg = StablePrefixSegmenter(cfg)
         seg.note_speech(True, 0.0, 0.0)
         text = " ".join(w for w, _ in words)

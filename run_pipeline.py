@@ -157,12 +157,19 @@ def main(argv=None):
     ap.add_argument("--speed", type=float, default=1.0, help="replay speed multiplier")
     ap.add_argument("--chunk-ms", type=float, default=160.0)
     ap.add_argument("--stability-ms", type=float, default=120.0)
-    ap.add_argument("--max-seg-chars", type=int, default=100)
+    ap.add_argument("--max-seg-chars", type=int, default=0,
+                    help="force a caption at this many draft characters "
+                         "(default 0 = no character cap)")
     ap.add_argument("--max-seg-seconds", type=float, default=6.0,
                     help="force a caption once a draft has been growing this long")
     ap.add_argument("--sentence-gap-ms", type=float, default=800.0,
-                    help="word gap that counts as a sentence boundary")
-    ap.add_argument("--sentence-min-chars", type=int, default=40)
+                    help="with --split-on-pauses: word gap that counts as a "
+                         "sentence boundary")
+    ap.add_argument("--sentence-min-chars", type=int, default=40,
+                    help="with --split-on-pauses: shortest piece worth cutting")
+    ap.add_argument("--split-on-pauses", action="store_true",
+                    help="split a committed draft at pauses inside it (off by "
+                         "default: one draft run = one caption)")
 
     ap.add_argument("--enhance", choices=["none", "spectral", "wiener"],
                     default="none", help="A=none, B=spectral/wiener")
@@ -182,14 +189,40 @@ def main(argv=None):
     ap.add_argument("--asr-model-dir", help="extracted sherpa-onnx streaming model")
     ap.add_argument("--asr-provider", default="cpu")
     ap.add_argument("--asr-threads", type=int, default=2)
+    ap.add_argument("--no-endpoint", action="store_true",
+                    help="disable sherpa's endpoint detector (on by default); "
+                         "captions then come only from forced cuts")
+    ap.add_argument("--rule1-ms", type=float, default=2400.0,
+                    help="endpoint rule1: trailing silence even with no decoded "
+                         "speech (default 2400)")
+    ap.add_argument("--rule2-ms", type=float, default=1200.0,
+                    help="endpoint rule2: trailing silence after decoded speech "
+                         "(default 1200)")
+    ap.add_argument("--rule3-sec", type=float, default=20.0,
+                    help="endpoint rule3: hard cap on one utterance (default 20 s)")
 
     ap.add_argument("--mt", choices=["identity", "opus"], default="identity")
     ap.add_argument("--mt-model", default="Helsinki-NLP/opus-mt-en-zh")
     ap.add_argument("--mt-device", default=None)
     ap.add_argument("--mt-context", action="store_true")
     ap.add_argument("--punct-model", default="",
-                    help="sherpa-onnx punctuation model (model.onnx); restores "
-                         ",.?! so segments break at sentence boundaries")
+                    help="punctuation model: a directory or a .onnx file. A dir "
+                         "containing bpe.vocab uses the online English CNN-BiLSTM; "
+                         "anything else uses the offline zh+en CT-Transformer")
+    ap.add_argument("--semantic-cuts", action="store_true",
+                    help="commit a caption when a stable sentence end appears "
+                         "inside the draft (needs --punct-model)")
+    ap.add_argument("--semantic-lookahead", type=int, default=8,
+                    help="words that must remain after a candidate cut (default 8)")
+    ap.add_argument("--semantic-confirm", type=int, default=2,
+                    help="consecutive runs that must agree on the cut (default 2)")
+    ap.add_argument("--semantic-min-chars", type=int, default=24,
+                    help="do not look for a cut below this draft size (default 24)")
+    ap.add_argument("--force-pause-ms", type=float, default=400.0,
+                    help="when a draft must be forced, back off to the latest "
+                         "pause at least this long (default 400 ms)")
+    ap.add_argument("--force-min-chars", type=int, default=20,
+                    help="text that must precede a forced pause cut (default 20)")
 
     ap.add_argument("--video-in", help="input video to subtitle")
     ap.add_argument("--video-out", help="write a subtitled MP4 here")
@@ -197,6 +230,8 @@ def main(argv=None):
                     help="length of the generated test video (0 = stream duration)")
     ap.add_argument("--font", help="path to a CJK font for burning subtitles")
     args = ap.parse_args(argv)
+    if args.semantic_cuts and not args.punct_model:
+        raise SystemExit("--semantic-cuts needs --punct-model <dir or model.onnx>")
 
     if args.asr == "sherpa":
         asr_snapshot = "sherpa:" + Path(args.asr_model_dir or "?").name
@@ -209,6 +244,17 @@ def main(argv=None):
         max_seg_seconds=args.max_seg_seconds,
         sentence_gap_ms=args.sentence_gap_ms,
         sentence_min_chars=args.sentence_min_chars,
+        split_on_pauses=args.split_on_pauses,
+        semantic_cuts=args.semantic_cuts,
+        semantic_lookahead_words=args.semantic_lookahead,
+        semantic_confirm=args.semantic_confirm,
+        semantic_min_chars=args.semantic_min_chars,
+        force_pause_ms=args.force_pause_ms,
+        force_min_chars=args.force_min_chars,
+        enable_endpoint_detection=not args.no_endpoint,
+        rule1_min_trailing_silence=args.rule1_ms / 1000.0,
+        rule2_min_trailing_silence=args.rule2_ms / 1000.0,
+        rule3_min_utterance_length=args.rule3_sec,
         asr_model=asr_snapshot,
         mt_model=args.mt_model if args.mt == "opus" else "identity",
     )
@@ -232,14 +278,23 @@ def main(argv=None):
     enhance_block_ms = args.enhance_block_ms if args.enhance != "none" else 0.0
 
     asr = build_asr(args, cfg, entries)
+    if args.asr == "sherpa":
+        print("endpoint:",
+              "on" if cfg.enable_endpoint_detection else "off",
+              f"rule1={cfg.rule1_min_trailing_silence * 1000:.0f}ms",
+              f"rule2={cfg.rule2_min_trailing_silence * 1000:.0f}ms",
+              f"rule3={cfg.rule3_min_utterance_length:.0f}s")
     mt = build_mt(args)
     punct = None
     if args.punct_model:
         from b_line.punct import PunctRestorer
         punct = PunctRestorer(args.punct_model)
-        cfg.punct_model = Path(punct.model_path).name
-    # No punctuation model: derive commas and full stops from word pauses, so
-    # each committed caption is a punctuated sentence instead of a bare slice.
+        cfg.punct_model = punct.describe()
+    if args.semantic_cuts:
+        print(f"semantic cuts: on (lookahead {cfg.semantic_lookahead_words} words, "
+              f"confirm {cfg.semantic_confirm}, min {cfg.semantic_min_chars} chars)")
+    # No punctuation model: each committed caption only gets a full stop.
+    # Commas guessed from pauses read as wrong, so none are invented.
     cfg.rule_punctuation = punct is None
     pipe = SubtitlePipeline(cfg, asr, mt, punct=punct)
 
@@ -274,6 +329,14 @@ def main(argv=None):
         print("link:", json.dumps(asdict(link_cfg), ensure_ascii=False))
     print("config_hash:", cfg.freeze())
     print("metrics:", json.dumps(met, ensure_ascii=False))
+    if args.asr == "sherpa":
+        print("endpoint_stats:", json.dumps({
+            "endpoints": getattr(asr, "endpoint_count", 0),
+            "forced": getattr(asr, "force_count", 0),
+            "streams": getattr(asr, "stream_count", 0),
+            "semantic_cuts": getattr(pipe, "semantic_cut_count", 0),
+            "pause_cuts": getattr(pipe, "pause_cut_count", 0),
+        }))
 
     if args.out:
         with open(args.out, "w", encoding="utf-8") as f:

@@ -10,7 +10,7 @@ from b_line.mt import IdentityMT
 from b_line.pipeline import SubtitlePipeline
 from b_line.segmenter import StablePrefixSegmenter
 from b_line.sources import SyntheticFrameSource, WavFrameSource
-from b_line.types import ASRUpdate, AudioFrame, Gap
+from b_line.types import ASRUpdate, AudioFrame, Gap, Segment
 
 
 def write_wav(path, samples, sr=16000, channels=1):
@@ -61,6 +61,23 @@ class _NoEndpointASR:
                          confidence=1.0, finalized=True)
 
 
+class TestEmitGranularity(unittest.TestCase):
+    def test_long_committed_slice_is_one_event_by_default(self):
+        cfg = BLineConfig()
+        pipe = SubtitlePipeline(cfg, _NoEndpointASR(), IdentityMT())
+        text = " ".join(["WORD"] * 40)      # 199 chars, over max_seg_chars
+        pipe._emit(Segment(0, 0.0, 5.0, text, 1.0))
+        self.assertEqual(len(pipe.events), 1,
+                         "one draft run on screen must become one caption")
+        self.assertEqual(pipe.events[0].text_en, text)
+
+    def test_split_on_pauses_still_caps_the_length(self):
+        cfg = BLineConfig(split_on_pauses=True, max_seg_chars=60)
+        pipe = SubtitlePipeline(cfg, _NoEndpointASR(), IdentityMT())
+        pipe._emit(Segment(0, 0.0, 5.0, "WORD " * 20, 1.0))
+        self.assertEqual(len(pipe.events), 2)
+
+
 class TestStallRecovery(unittest.TestCase):
     def test_long_draft_is_force_finalized(self):
         cfg = BLineConfig(max_seg_chars=40, max_seg_seconds=8.0)
@@ -73,6 +90,19 @@ class TestStallRecovery(unittest.TestCase):
         self.assertEqual(asr.forced, 1)
         self.assertGreaterEqual(len(pipe.events), 1,
                                 "a stalled draft must still reach the screen")
+
+    def test_zero_char_cap_does_not_fire_on_length(self):
+        cfg = BLineConfig(max_seg_chars=0, max_seg_seconds=8.0)
+        asr = _NoEndpointASR()
+        asr.text = "WORD " * 60                 # 299 characters
+        pipe = SubtitlePipeline(cfg, asr, IdentityMT())
+        pipe.segmenter.partial = asr.text
+        pipe.segmenter._draft_since = 1.0
+        pipe._maybe_force_finalize(1.5)         # age 0.5 s < 8 s
+        self.assertEqual(asr.forced, 0, "0 must mean no character cap")
+        self.assertEqual(pipe.events, [])
+        pipe._maybe_force_finalize(10.0)        # age 9 s >= 8 s
+        self.assertEqual(asr.forced, 1)
 
     def test_backend_without_force_finalize_does_not_crash(self):
         cfg = BLineConfig(max_seg_chars=40)
