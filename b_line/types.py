@@ -38,11 +38,15 @@ class ASRUpdate:
 
     'text' is the full partial transcript so far and may be rewritten on later
     updates. 'stable_chars' is the length of the prefix that will not change.
+    'words' optionally carries (word, end_time_sec) for the whole text, when the
+    backend exposes token timestamps; the segmenter uses the gaps between them
+    to place sentence boundaries.
     """
     text: str
     stable_chars: int
     confidence: float
     finalized: bool = False
+    words: Optional[list] = None
 
 
 @dataclass

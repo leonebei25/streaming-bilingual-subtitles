@@ -32,6 +32,17 @@ class ASRBackend(ABC):
     def finalize(self) -> ASRUpdate:
         return ASRUpdate(text="", stable_chars=0, confidence=0.0, finalized=True)
 
+    def force_finalize(self) -> Optional[ASRUpdate]:
+        """Fold the current partial into the finalized text.
+
+        The pipeline calls this when one utterance has stayed a draft far
+        longer than a caption should, and the recognizer has not ended it on
+        its own (continuous speech, background noise, a model without
+        endpointing). Returning None means this backend cannot do it and the
+        draft is left alone.
+        """
+        return None
+
 
 class ScriptedASR(ASRBackend):
     """Reveal a known transcript as the audio timeline advances.
@@ -80,20 +91,49 @@ class ScriptedASR(ASRBackend):
         text, stable, conf = self._reveal()
         return ASRUpdate(text=text, stable_chars=stable, confidence=conf, finalized=True)
 
-
-def _common_prefix_len(a: str, b: str) -> int:
-    n = 0
-    for x, y in zip(a, b):
-        if x != y:
-            break
-        n += 1
-    return n
+    def force_finalize(self) -> ASRUpdate:
+        # End whichever utterance is being revealed, so the normal reveal path
+        # finalizes it instead of inventing a second source of truth.
+        for (t0, t1, _text, _c) in self.script:
+            if t0 <= self.covered_sec < t1:
+                self.covered_sec = t1
+                break
+        text, _stable, conf = self._reveal()
+        return ASRUpdate(text=text, stable_chars=len(text), confidence=conf,
+                         finalized=True)
 
 
 def _join_text(left: str, right: str) -> str:
     if left and right:
         return f"{left} {right}".strip()
     return (left or right).strip()
+
+
+def _tokens_to_words(tokens, timestamps):
+    """Group sub-word tokens into words, each with its end time.
+
+    sherpa's zipformer marks a word start with '▁'. Returns None when the token
+    stream does not follow that convention, so callers fall back to text only.
+    """
+    if not tokens or not timestamps or len(tokens) != len(timestamps):
+        return None
+    words = []
+    cur: list = []
+    cur_t = 0.0
+    for tok, t in zip(tokens, timestamps):
+        if not isinstance(tok, str):
+            return None
+        starts_word = tok.startswith("▁") or tok.startswith(" ")
+        piece = tok.lstrip("▁ ").strip()
+        if starts_word and cur:
+            words.append(("".join(cur), cur_t))
+            cur = []
+        if piece:
+            cur.append(piece)
+        cur_t = float(t)
+    if cur:
+        words.append(("".join(cur), cur_t))
+    return words or None
 
 
 class SherpaASR(ASRBackend):
@@ -189,7 +229,7 @@ class SherpaASR(ASRBackend):
     def reset(self) -> None:
         self._stream = self._rec.create_stream()
         self._session_text = ""
-        self._last_partial = ""
+        self._session_words: list = []
 
     def _decode(self) -> str:
         while self._rec.is_ready(self._stream):
@@ -201,27 +241,54 @@ class SherpaASR(ASRBackend):
             return result.strip()
         return (getattr(result, "text", "") or "").strip()
 
+    def _result(self):
+        """Return (text, words) where words carries per-word end times.
+
+        get_result_all() exposes tokens + timestamps; older wrappers only have
+        get_result(), in which case words is None and the segmenter works on
+        plain text.
+        """
+        while self._rec.is_ready(self._stream):
+            self._rec.decode_stream(self._stream)
+        get_all = getattr(self._rec, "get_result_all", None)
+        if get_all is not None:
+            try:
+                r = get_all(self._stream)
+                text = (getattr(r, "text", "") or "").strip()
+                words = _tokens_to_words(
+                    getattr(r, "tokens", None), getattr(r, "timestamps", None)
+                )
+                if text:
+                    return text, words
+            except Exception:
+                pass
+        return self._decode(), None
+
     def _update(self, finalized: bool) -> ASRUpdate:
-        current = self._decode()
+        current, cur_words = self._result()
+        # The finalized prefix is the whole sentences sherpa has ended itself.
+        # The current partial is a separate draft: it is *not* folded into
+        # stable via a longest-common-prefix, because a transducer rewrites its
+        # tail and that made captions look chopped mid-sentence.
         if self._rec.is_endpoint(self._stream):
             if current:
                 self._session_text = _join_text(self._session_text, current)
+                self._session_words = list(self._session_words) + list(cur_words or [])
             self._rec.reset(self._stream)
-            self._last_partial = ""
-            current = ""
+            current, cur_words = "", None
+        elif finalized and current:
+            self._session_text = _join_text(self._session_text, current)
+            self._session_words = list(self._session_words) + list(cur_words or [])
+            current, cur_words = "", None
 
         text = _join_text(self._session_text, current)
-        stable = len(self._session_text)
-        if current:
-            if stable:
-                stable += 1
-            stable += _common_prefix_len(self._last_partial, current)
-        self._last_partial = current
+        words = list(self._session_words) + list(cur_words or [])
         return ASRUpdate(
             text=text,
-            stable_chars=stable,
+            stable_chars=len(self._session_text),
             confidence=1.0,
             finalized=finalized,
+            words=words or None,
         )
 
     def stream(self, samples, start_sec: float, end_sec: float) -> ASRUpdate:
@@ -232,6 +299,19 @@ class SherpaASR(ASRBackend):
 
     def finalize(self) -> ASRUpdate:
         return self._update(finalized=True)
+
+    def force_finalize(self) -> ASRUpdate:
+        """End the current utterance at the current partial, even if sherpa has
+        not endpointed. Keeps the bookkeeping inside one place: the text moves
+        from draft to session_text, so the segmenter can never see it twice."""
+        current, cur_words = self._result()
+        if current:
+            self._session_text = _join_text(self._session_text, current)
+            self._session_words = list(self._session_words) + list(cur_words or [])
+        self._rec.reset(self._stream)
+        text = self._session_text
+        return ASRUpdate(text=text, stable_chars=len(text), confidence=1.0,
+                         finalized=True, words=self._session_words or None)
 
 
 class Qwen3ASR(ASRBackend):

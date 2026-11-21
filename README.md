@@ -15,11 +15,14 @@ real-time branch must not access audio that has not yet arrived.
       sources.py     FrameSource: WavFrameSource / SyntheticFrameSource / MicFrameSource
       vad.py         energy + zero-crossing VAD with hangover endpointing
       asr.py         ASR protocol, ScriptedASR (mock), SherpaASR (real), Qwen3ASR (stub)
-      segmenter.py   stable-prefix segmentation (endpoint + forced split + gap flush)
+      segmenter.py   ASR-finalized sentence segmentation (stable_chars + onset)
+      sentence.py    sentence splitting (punctuation, discourse markers, cap)
+      punct.py       optional punctuation restoration (sherpa-onnx CT-Transformer)
       mt.py          MT protocol, IdentityMT (mock), OpusMT (real), PretrainedMT (stub)
       metrics.py     WER, chrF, timing error, RTF, latency percentiles
       manifest.py    60/20/20 data split by speaker/source
       pipeline.py    orchestration: source -> VAD -> ASR -> segmenter -> MT -> events
+      display.py     reading-time pacing and the caption queue (min hold, backlog)
     a_line/
       link.py        packetization, 40 ms base delay, jitter, loss, jitter buffer
       enhance/
@@ -29,6 +32,7 @@ real-time branch must not access audio that has not yet arrived.
         source.py    EnhancedFrameSource: blocks, enhances, re-emits original frames
       video.py       burn subtitle events into an MP4
     run_pipeline.py  CLI driver
+    scripts/live_demo.py      video + scrolling transcript window
     scripts/desktop_smoke.py  A/B smoke run with events, metrics and video
     tools/convert_wav.py      convert any PCM WAV to 16 kHz mono 16-bit
     selftest.py      end-to-end smoke test with assertions
@@ -150,6 +154,34 @@ The transcript JSON used by the mock recognizer looks like:
    `gap_reset_ms` (default 500 ms) emit a gap event and flush the recogniser
    chunk, but keep the VAD and segmenter state, so a 20 ms lost packet does not
    shift every later subtitle.
+7. **Sentences come from the recognizer, not the VAD**: `stable_chars` is the
+   prefix the ASR has finalized, and each growth of it commits one whole
+   sentence. Sherpa's endpoint (language-model based, ~1.2 s of trailing
+   silence) decides boundaries, so a mid-sentence breath no longer chops a
+   caption. The VAD only stamps `t_start` with the frame-accurate speech onset.
+   If a sentence stays a draft past `max_seg_seconds` (10 s) / `max_seg_chars`
+   (160) -- the recognizer never endpointed, e.g. music or continuous speech --
+   the pipeline asks the ASR to close it (`force_finalize`), so captions cannot
+   stop appearing.
+8. **Long stretches are split at real pauses, and every caption ends with a
+   full stop**: when the recognizer exposes word timestamps (`get_result_all`),
+   a forced slice is cut at gaps of at least `sentence_gap_ms` (default 800 ms)
+   once the piece is at least `sentence_min_chars` (60) long, so the cut lands
+   where the speaker actually paused. The recognizer emits no marks, so a
+   committed caption gets a terminal full stop (`rule_punctuation`). Marks
+   *inside* a sentence are never guessed from pauses -- that produced wrong
+   commas -- only `--punct-model` may place them.
+9. **The transcript keeps everything and types itself out**: every finalized
+   sentence is appended with its timestamp, its English text, and the Chinese
+   translation underneath when MT is on. Text is revealed one character at a
+   time (30 characters/s, draining any backlog over ~1.2 s) -- including a
+   sentence that arrives in one piece from a backend that returns no partials,
+   so a block of text is never pasted on screen. The sentence still being
+   spoken is the green `▌` line at the bottom; when the recognizer ends it, the
+   same words move into the transcript with the full stop added. The panel
+   follows the newest line until you scroll up, and End (or scrolling back
+   down) resumes it. `CaptionQueue` still supplies the hold/lag figures printed
+   by `--debug`, but it no longer decides what is on screen.
 
 ## Real vs. stubbed
 

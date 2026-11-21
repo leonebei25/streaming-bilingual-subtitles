@@ -96,6 +96,14 @@ def evaluate(
         if lats:
             out["latency_p50_ms"] = float(np.percentile(lats, 50) * 1000.0)
             out["latency_p95_ms"] = float(np.percentile(lats, 95) * 1000.0)
+        # Second view: how long after the last word the caption appeared. The
+        # course metric is measured from t_start (so it includes the segment's
+        # own duration); this one is the delay a viewer perceives at the end of
+        # a sentence and is the part the pipeline can actually shrink.
+        tails = [e.emitted_at - e.t_end for e in subs if e.emitted_at is not None]
+        if tails:
+            out["latency_from_end_p50_ms"] = float(np.percentile(tails, 50) * 1000.0)
+            out["latency_from_end_p95_ms"] = float(np.percentile(tails, 95) * 1000.0)
 
     if duration_sec and processing_sec is not None and duration_sec > 0:
         out["rtf"] = processing_sec / duration_sec

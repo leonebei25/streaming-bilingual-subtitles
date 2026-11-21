@@ -6,7 +6,9 @@ the audio enhancement.
 """
 from __future__ import annotations
 
+import os
 from abc import ABC, abstractmethod
+from pathlib import Path
 from typing import Optional, Sequence, Tuple
 
 
@@ -17,11 +19,16 @@ class MTBackend(ABC):
 
 
 class IdentityMT(MTBackend):
-    """Deterministic stand-in that wraps the source text; lets the pipeline run
-    end-to-end before a real translation model is configured."""
+    """Deterministic stand-in: performs no translation.
+
+    It returns an empty string rather than tagging the source text. The tags
+    used to end up on screen ([zh]...[/zh]) as soon as the mock was selected in
+    the demo, which is never something a viewer should see. An empty string
+    makes the display fall back to the English caption.
+    """
 
     def translate(self, text_en, context=()) -> Tuple[str, float]:
-        return f"[zh]{text_en}[/zh]", 1.0
+        return "", 1.0
 
 
 class OpusMT(MTBackend):
@@ -44,6 +51,7 @@ class OpusMT(MTBackend):
         max_length: int = 256,
         num_beams: int = 4,
         use_context: bool = False,
+        local_files_only: Optional[bool] = None,
     ):
         try:
             import torch
@@ -55,9 +63,34 @@ class OpusMT(MTBackend):
                 "sure the model directory is available offline."
             ) from exc
 
+        # A local directory never needs the hub. A bare repo id does, unless
+        # HF_HUB_OFFLINE is set -- otherwise every run waits on DNS before it
+        # can say the model was already cached.
+        if local_files_only is None:
+            offline = os.environ.get("HF_HUB_OFFLINE", "").strip().lower()
+            local_files_only = bool(offline and offline not in ("0", "false")) \
+                or Path(model_name).is_dir()
+        load_kwargs = {"local_files_only": True} if local_files_only else {}
+
         self._torch = torch
-        self._tokenizer = MarianTokenizer.from_pretrained(model_name)
-        self._model = MarianMTModel.from_pretrained(model_name)
+        try:
+            self._tokenizer = MarianTokenizer.from_pretrained(model_name, **load_kwargs)
+            self._model = MarianMTModel.from_pretrained(model_name, **load_kwargs)
+        except Exception as exc:
+            source = ("the local directory" if Path(model_name).is_dir()
+                      else "the Hugging Face cache")
+            raise RuntimeError(
+                f"cannot load the MT model {model_name!r} from {source}: {exc}\n"
+                "Download it once with network access, then point at the folder:\n"
+                "  pip install -U huggingface_hub\n"
+                "  $env:HF_ENDPOINT = 'https://hf-mirror.com'   # if huggingface.co "
+                "is unreachable\n"
+                "  huggingface-cli download Helsinki-NLP/opus-mt-en-zh "
+                "--local-dir models/opus-mt-en-zh\n"
+                "  python scripts/live_demo.py ... --mt opus "
+                "--mt-model models/opus-mt-en-zh\n"
+                "To run without translation use --mt none (English only)."
+            ) from exc
         self._device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self._model.to(self._device)
         self._model.eval()

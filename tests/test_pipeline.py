@@ -6,6 +6,8 @@ import wave
 import numpy as np
 
 from b_line.config import BLineConfig
+from b_line.mt import IdentityMT
+from b_line.pipeline import SubtitlePipeline
 from b_line.segmenter import StablePrefixSegmenter
 from b_line.sources import SyntheticFrameSource, WavFrameSource
 from b_line.types import ASRUpdate, AudioFrame, Gap
@@ -21,18 +23,66 @@ def write_wav(path, samples, sr=16000, channels=1):
 
 
 class TestSegmenter(unittest.TestCase):
-    def test_forced_split_reconstructs_text(self):
-        cfg = BLineConfig(max_seg_chars=10, stability_delay_ms=100.0)
+    def test_finalized_text_commits_whole_sentence(self):
+        cfg = BLineConfig()
         seg = StablePrefixSegmenter(cfg)
         text = "alpha beta gamma delta epsilon"
         seg.note_speech(True, 0.0, 0.0)
         seg.update(ASRUpdate(text=text, stable_chars=len(text), confidence=0.9), 0.0)
-        seg.on_endpoint(1.0)
-        seg.note_speech(False, 1.3)
-        seg.update(ASRUpdate(text=text, stable_chars=len(text), confidence=0.9), 1.3)
         out = seg.pop()
-        self.assertGreaterEqual(len(out), 1)
-        self.assertEqual(" ".join(s.text_en for s in out), text)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0].text_en, text)
+
+
+class _NoEndpointASR:
+    """Finalizes nothing on its own: stable_chars stays 0, like sherpa on
+    continuous speech that never hits its silence endpoint."""
+
+    def __init__(self):
+        self.text = ""
+        self.forced = 0
+
+    def reset(self):
+        self.text = ""
+        self.forced = 0
+
+    def stream(self, samples, start_sec, end_sec):
+        words = max(0, int(end_sec * 8))
+        self.text = " ".join(["WORD"] * words)
+        return ASRUpdate(text=self.text, stable_chars=0, confidence=1.0)
+
+    def finalize(self):
+        return ASRUpdate(text=self.text, stable_chars=len(self.text),
+                         confidence=1.0, finalized=True)
+
+    def force_finalize(self):
+        self.forced += 1
+        return ASRUpdate(text=self.text, stable_chars=len(self.text),
+                         confidence=1.0, finalized=True)
+
+
+class TestStallRecovery(unittest.TestCase):
+    def test_long_draft_is_force_finalized(self):
+        cfg = BLineConfig(max_seg_chars=40, max_seg_seconds=8.0)
+        asr = _NoEndpointASR()
+        asr.text = "WORD " * 10
+        pipe = SubtitlePipeline(cfg, asr, IdentityMT())
+        pipe.segmenter.partial = "WORD " * 10       # 50 chars > 40
+        pipe.segmenter._draft_since = 1.0
+        pipe._maybe_force_finalize(1.5)
+        self.assertEqual(asr.forced, 1)
+        self.assertGreaterEqual(len(pipe.events), 1,
+                                "a stalled draft must still reach the screen")
+
+    def test_backend_without_force_finalize_does_not_crash(self):
+        cfg = BLineConfig(max_seg_chars=40)
+        asr = _NoEndpointASR()
+        asr.force_finalize = None
+        pipe = SubtitlePipeline(cfg, asr, IdentityMT())
+        pipe.segmenter.partial = "WORD " * 10
+        pipe.segmenter._draft_since = 1.0
+        pipe._maybe_force_finalize(1.5)   # must simply do nothing
+        self.assertEqual(pipe.events, [])
 
 
 class TestWavSource(unittest.TestCase):

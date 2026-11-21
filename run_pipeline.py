@@ -155,8 +155,14 @@ def main(argv=None):
     ap.add_argument("--loss", help="comma-separated t0-t1 loss windows, e.g. 5.0-5.4")
     ap.add_argument("--realtime", action="store_true", help="release audio at wall-clock rate")
     ap.add_argument("--speed", type=float, default=1.0, help="replay speed multiplier")
-    ap.add_argument("--chunk-ms", type=float, default=320.0)
-    ap.add_argument("--stability-ms", type=float, default=240.0)
+    ap.add_argument("--chunk-ms", type=float, default=160.0)
+    ap.add_argument("--stability-ms", type=float, default=120.0)
+    ap.add_argument("--max-seg-chars", type=int, default=100)
+    ap.add_argument("--max-seg-seconds", type=float, default=6.0,
+                    help="force a caption once a draft has been growing this long")
+    ap.add_argument("--sentence-gap-ms", type=float, default=800.0,
+                    help="word gap that counts as a sentence boundary")
+    ap.add_argument("--sentence-min-chars", type=int, default=40)
 
     ap.add_argument("--enhance", choices=["none", "spectral", "wiener"],
                     default="none", help="A=none, B=spectral/wiener")
@@ -181,6 +187,9 @@ def main(argv=None):
     ap.add_argument("--mt-model", default="Helsinki-NLP/opus-mt-en-zh")
     ap.add_argument("--mt-device", default=None)
     ap.add_argument("--mt-context", action="store_true")
+    ap.add_argument("--punct-model", default="",
+                    help="sherpa-onnx punctuation model (model.onnx); restores "
+                         ",.?! so segments break at sentence boundaries")
 
     ap.add_argument("--video-in", help="input video to subtitle")
     ap.add_argument("--video-out", help="write a subtitled MP4 here")
@@ -189,11 +198,19 @@ def main(argv=None):
     ap.add_argument("--font", help="path to a CJK font for burning subtitles")
     args = ap.parse_args(argv)
 
-    max_seg = 60 if args.synth else 120
+    if args.asr == "sherpa":
+        asr_snapshot = "sherpa:" + Path(args.asr_model_dir or "?").name
+    else:
+        asr_snapshot = "scripted"
     cfg = BLineConfig(
         chunk_ms=args.chunk_ms,
         stability_delay_ms=args.stability_ms,
-        max_seg_chars=max_seg,
+        max_seg_chars=args.max_seg_chars,
+        max_seg_seconds=args.max_seg_seconds,
+        sentence_gap_ms=args.sentence_gap_ms,
+        sentence_min_chars=args.sentence_min_chars,
+        asr_model=asr_snapshot,
+        mt_model=args.mt_model if args.mt == "opus" else "identity",
     )
 
     loss = parse_loss(args.loss)
@@ -216,7 +233,15 @@ def main(argv=None):
 
     asr = build_asr(args, cfg, entries)
     mt = build_mt(args)
-    pipe = SubtitlePipeline(cfg, asr, mt)
+    punct = None
+    if args.punct_model:
+        from b_line.punct import PunctRestorer
+        punct = PunctRestorer(args.punct_model)
+        cfg.punct_model = Path(punct.model_path).name
+    # No punctuation model: derive commas and full stops from word pauses, so
+    # each committed caption is a punctuated sentence instead of a bare slice.
+    cfg.rule_punctuation = punct is None
+    pipe = SubtitlePipeline(cfg, asr, mt, punct=punct)
 
     t0 = time.perf_counter()
     events = pipe.run(source)
