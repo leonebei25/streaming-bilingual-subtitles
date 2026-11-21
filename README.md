@@ -17,7 +17,8 @@ real-time branch must not access audio that has not yet arrived.
       asr.py         ASR protocol, ScriptedASR (mock), SherpaASR (real), Qwen3ASR (stub)
       segmenter.py   ASR-finalized sentence segmentation (stable_chars + onset)
       sentence.py    sentence splitting (punctuation, discourse markers, cap)
-      punct.py       optional punctuation restoration (sherpa-onnx CT-Transformer)
+      punct.py       optional punctuation restoration (sherpa-onnx online
+                     CNN-BiLSTM, or offline zh+en CT-Transformer)
       mt.py          MT protocol, IdentityMT (mock), OpusMT (real), PretrainedMT (stub)
       metrics.py     WER, chrF, timing error, RTF, latency percentiles
       manifest.py    60/20/20 data split by speaker/source
@@ -156,22 +157,44 @@ The transcript JSON used by the mock recognizer looks like:
    shift every later subtitle.
 7. **Sentences come from the recognizer, not the VAD**: `stable_chars` is the
    prefix the ASR has finalized, and each growth of it commits one whole
-   sentence. Sherpa's endpoint (language-model based, ~1.2 s of trailing
-   silence) decides boundaries, so a mid-sentence breath no longer chops a
-   caption. The VAD only stamps `t_start` with the frame-accurate speech onset.
-   If a sentence stays a draft past `max_seg_seconds` (10 s) / `max_seg_chars`
-   (160) -- the recognizer never endpointed, e.g. music or continuous speech --
-   the pipeline asks the ASR to close it (`force_finalize`), so captions cannot
-   stop appearing.
-8. **Long stretches are split at real pauses, and every caption ends with a
-   full stop**: when the recognizer exposes word timestamps (`get_result_all`),
-   a forced slice is cut at gaps of at least `sentence_gap_ms` (default 800 ms)
-   once the piece is at least `sentence_min_chars` (60) long, so the cut lands
-   where the speaker actually paused. The recognizer emits no marks, so a
-   committed caption gets a terminal full stop (`rule_punctuation`). Marks
-   *inside* a sentence are never guessed from pauses -- that produced wrong
-   commas -- only `--punct-model` may place them.
-9. **The transcript keeps everything and types itself out**: every finalized
+   sentence. Sherpa's endpoint decides boundaries from trailing silence: 1.2 s
+   after decoded speech, 2.4 s even with nothing decoded, or a 20 s hard cap.
+   Endpoint detection is enabled explicitly (`enable_endpoint_detection`,
+   default on; sherpa's own default is off, which silently turns sentence
+   segmentation into forced 10 s / 160-character cuts). Tune it with
+   `--rule1-ms`, `--rule2-ms`, `--rule3-sec`, or turn it off with
+   `--no-endpoint`. The VAD only stamps `t_start` with the frame-accurate
+   speech onset.
+   If a sentence stays a draft past `max_seg_seconds` (15 s in the live demo) --
+   the recognizer never endpointed, e.g. music or continuous speech -- the
+   pipeline asks the ASR to close it (`force_finalize`), so captions cannot stop
+   appearing. Before giving up, a forced commit first backs off to the latest
+   pause of at least `force_pause_ms` (400 ms) using the word timings, and only
+   cuts at the draft's end when there is no such pause. A character cap is
+   available (`--max-seg-chars`) but is off by default; the draft's age and
+   sherpa's 20 s rule3 are the only length limits.
+8. **One draft run is one caption, and every caption ends with a full stop**:
+   whatever boundary ends the draft (the ASR endpoint, a semantic cut, or a
+   forced commit) is the only splitter, so the line the viewer watched growing
+   becomes exactly one caption. Word times are shifted to absolute audio
+   seconds, so a caption's `t_end` is the end of its last word rather than the
+   moment it was committed, and two captions never overlap. The recognizer
+   emits no marks, so a committed caption gets a terminal full stop
+   (`rule_punctuation`). Marks *inside* a sentence are never guessed from
+   pauses -- that produced wrong commas -- only `--punct-model` may place them.
+   `--split-on-pauses` re-enables cutting a committed slice at word gaps of at
+   least `sentence_gap_ms` (800 ms) once the piece is at least
+   `sentence_min_chars` (60) long, when smaller captions matter more than the
+   draft/final correspondence.
+9. **Semantic cuts (optional)**: with `--punct-model` plus `--semantic-cuts`,
+   the live draft is punctuated on a ~320 ms cadence. A sentence-final mark
+   that leaves at least `--semantic-lookahead` (8) words after it and appears at
+   the same offset on `--semantic-confirm` (2) consecutive runs becomes a cut:
+   everything before it is committed, the rest keeps growing as the draft. The
+   recognizer is never reset, so only the committed/draft boundary moves; the
+   endpoint still caps the utterance and `max_seg_seconds` is the stall guard.
+   Leave it off for the A/B baseline.
+10. **The transcript keeps everything and types itself out**: every finalized
    sentence is appended with its timestamp, its English text, and the Chinese
    translation underneath when MT is on. Text is revealed one character at a
    time (30 characters/s, draining any backlog over ~1.2 s) -- including a
@@ -203,6 +226,14 @@ Desktop dependencies are in `requirements-desktop.txt`. The sherpa model is a
 separate download (e.g. `sherpa-onnx-streaming-zipformer-en-2023-06-26`) and the
 MarianMT weights are fetched by `transformers` or supplied as a local directory
 for offline use.
+
+A punctuation model is optional. `--punct-model` accepts an extracted directory
+or a single `.onnx` file: a directory containing `bpe.vocab` is the online
+English CNN-BiLSTM (`sherpa-onnx-online-punct-en-2024-08-06`, ~30 MB, also
+restores casing), anything else is the offline zh+en CT-Transformer (~279 MB).
+Both come from the `punctuation-models` release; `scripts/check_punct.py`
+loads one and prints its per-call latency. Punctuation adds marks to a caption;
+it does not change where the caption starts or ends.
 
 ## Next steps
 

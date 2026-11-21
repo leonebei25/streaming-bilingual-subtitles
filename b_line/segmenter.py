@@ -75,24 +75,37 @@ class StablePrefixSegmenter:
         if is_speech and self.cur_start is None and onset != self._used_onset:
             self.cur_start = onset
 
-    def update(self, update: ASRUpdate, now_sec: float) -> None:
+    def update(self, update: ASRUpdate, now_sec: float,
+               end_sec: Optional[float] = None) -> None:
+        """Advance from one recognizer update.
+
+        ``stable_chars`` may be pushed past what the recognizer itself
+        finalized -- that is how a semantic cut commits a prefix while the rest
+        is still a draft. ``end_sec`` is the audio time of that boundary when
+        known, so latency is not measured from the end of the untrimmed tail.
+        """
         self.last_conf = update.confidence
 
-        # The ASR finalized one or more whole sentences.
-        finalized = update.text[:update.stable_chars]
+        # Never move backwards: after a semantic cut, the recognizer still
+        # reports the committed text as part of its draft.
+        stable = max(update.stable_chars, self.emitted)
+
+        committed = False
+        finalized = update.text[:stable]
         if len(finalized) > self.emitted:
             start = self.emitted
             new_text = finalized[start:].strip()
             words = _slice_words(getattr(update, "words", None), update.text,
-                                 start, update.stable_chars)
+                                 start, stable)
             self.emitted = len(finalized)
             if new_text:
-                self._commit_sentences(new_text, words, now_sec)
+                self._commit_sentences(new_text, words, now_sec, end_sec)
+                committed = True
 
         # Everything after the finalized prefix is the live draft.
-        self.partial = update.text[update.stable_chars:].strip()
+        self.partial = update.text[stable:].strip()
         if self.partial:
-            if self._draft_since is None:
+            if committed or self._draft_since is None:
                 self._draft_since = now_sec
         else:
             self._draft_since = None
@@ -116,50 +129,74 @@ class StablePrefixSegmenter:
         self.pending = []
         return out
 
-    def _commit_sentences(self, text: str, words, now_sec: float) -> None:
-        """Commit one finalized slice, split at the largest inter-word pauses.
+    def _commit_sentences(self, text: str, words, now_sec: float,
+                          end_sec: Optional[float] = None) -> None:
+        """Commit one finalized slice.
 
-        Word timestamps are only used for their *differences* (where the pauses
-        are); they are not absolute -- sherpa restarts them at zero every time
-        the stream is reset. Each piece's span is therefore allocated from the
-        audio clock by character count, which cannot produce a zero-length or
-        backwards segment.
+        By default the slice goes to the screen whole: the boundary that ended
+        the draft (the ASR endpoint, a semantic cut, or a forced commit) is the
+        only splitter, so one draft run on screen becomes exactly one caption.
+        With ``split_on_pauses`` enabled the slice is instead cut at the largest
+        inter-word pauses, so each caption still ends where the speaker
+        breathed.
+
+        Word timestamps are absolute audio seconds (SherpaASR shifts them by
+        the stream origin), so a caption's t_end is the end of its last word,
+        not the moment the commit happened. ``end_sec`` overrides that when the
+        caller knows the boundary exactly (semantic and pause cuts).
         """
+        if not getattr(self.cfg, "split_on_pauses", False):
+            self._commit(self._sentence_text(text, words),
+                         self._boundary_time(words, end_sec, now_sec))
+            return
+
         groups = self._group_by_gaps(words)
         if len(groups) <= 1:
-            self._commit(self._sentence_text(text, words), now_sec)
+            self._commit(self._sentence_text(text, words),
+                         self._boundary_time(words, end_sec, now_sec))
             return
 
-        pieces = [self._sentence_text(" ".join(w for w, _ in grp).strip(), grp)
+        pieces = [(self._sentence_text(" ".join(w for w, _ in grp).strip(), grp), grp)
                   for grp in groups]
-        pieces = [p for p in pieces if p]
+        pieces = [(p, grp) for p, grp in pieces if p]
         if len(pieces) <= 1:
-            self._commit(self._sentence_text(text, words), now_sec)
+            self._commit(self._sentence_text(text, words),
+                         self._boundary_time(words, end_sec, now_sec))
             return
 
-        # Anchor the span from the word clock's own duration: the differences
-        # are valid even though the absolute values restart at every reset.
-        dur = 0.0
-        if len(words) > 1:
-            dur = words[-1][1] - words[0][1]
-            if not 0.0 < dur < 60.0:
-                dur = 0.0
+        # With real word times, every piece ends where its own last word ended.
+        if all(grp and grp[-1][1] is not None for _, grp in pieces):
+            for piece, grp in pieces:
+                self._commit(piece, grp[-1][1])
+            return
+
+        # No timings: spread the slice over [start, end] by character count.
+        span_end = self._boundary_time(words, end_sec, now_sec)
         start = self.cur_start if self.cur_start is not None else self._last_end
-        start = min(start, now_sec)
-        if dur:
-            start = max(start, now_sec - dur)
-        span = max(now_sec - start, 0.2 * len(pieces))
-        total = sum(len(p) for p in pieces) or 1
+        start = max(start, self._last_end)
+        span = max(span_end - start, 0.2 * len(pieces))
+        total = sum(len(p) for p, _ in pieces) or 1
         acc = 0
-        for piece in pieces:
+        for piece, _grp in pieces:
             acc += len(piece)
             self._commit(piece, start + span * acc / total)
+
+    @staticmethod
+    def _boundary_time(words, end_hint: Optional[float], now_sec: float) -> float:
+        """When the committed text actually ended, in audio seconds."""
+        if end_hint is not None:
+            return float(end_hint)
+        if words:
+            t = words[-1][1]
+            if t is not None:
+                return float(t)
+        return float(now_sec)
 
     def _group_by_gaps(self, words):
         if not words or len(words) < 4:
             return []
         gap_s = max(0.05, self.cfg.sentence_gap_ms / 1000.0)
-        max_chars = max(1, int(self.cfg.max_seg_chars))
+        max_chars = int(self.cfg.max_seg_chars)      # 0 = no length cap
         min_chars = max(1, int(getattr(self.cfg, "sentence_min_chars", 25)))
         groups, cur, cur_len = [], [], 0
         for i, (w, t) in enumerate(words):
@@ -173,7 +210,7 @@ class StablePrefixSegmenter:
             if usable_gap and gap >= gap_s and cur_len >= min_chars:
                 groups.append(cur)
                 cur, cur_len = [], 0
-            elif cur_len >= max_chars:
+            elif max_chars > 0 and cur_len >= max_chars:
                 # Over the length limit: cut at the biggest pause inside the
                 # group rather than at whatever word happens to hit the limit,
                 # so the caption still ends where the speaker breathed.
@@ -223,16 +260,19 @@ class StablePrefixSegmenter:
             return t
         return t + "."
 
-    def _commit(self, text: str, now_sec: float) -> None:
+    def _commit(self, text: str, end_sec: float) -> None:
         # With no fresh VAD onset (two sentences inside one speech run), a
         # segment starts where the previous one ended: contiguous spans beat a
         # zero-length segment stamped at its own commit time.
         if self.cur_start is not None:
+            self._used_onset = self.cur_start
             s = self.cur_start
-            self._used_onset = s
         else:
-            s = min(self._last_end, now_sec)
-        e = max(now_sec, s + 0.05)   # a caption must never have zero duration
+            s = self._last_end
+        # A VAD onset can be older than the previous caption's end (the speaker
+        # began before the endpoint fired). Captions must never overlap.
+        s = max(s, self._last_end)
+        e = max(float(end_sec), s + 0.05)   # never a zero-length caption
         self.pending.append(Segment(self.seg_id, s, e, text, self.last_conf))
         self.seg_id += 1
         self._last_end = e

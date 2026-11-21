@@ -144,11 +144,11 @@ class SherpaASR(ASRBackend):
     The recognizer emits partial text for the current utterance; this adapter
     keeps the cumulative contract expected by ``StablePrefixSegmenter``:
     ``ASRUpdate.text`` is the whole session transcript and ``stable_chars``
-    covers finalized utterances plus the longest common prefix of the current
-    partial.
-
-    The stream is reset at sherpa's own endpoint. The pipeline's VAD still
-    decides when a segment ends; the two are allowed to fire independently.
+    covers the utterances sherpa has already ended, so only those become
+    segments. Sentence boundaries therefore require endpoint detection to be
+    enabled (``BLineConfig.enable_endpoint_detection``, on by default); with it
+    off nothing is ever finalized until the pipeline forces a commit. The VAD
+    only supplies ``t_start``.
     """
 
     def __init__(
@@ -162,6 +162,10 @@ class SherpaASR(ASRBackend):
         num_threads: int = 2,
         decoding_method: str = "greedy_search",
         provider: str = "cpu",
+        enable_endpoint_detection: Optional[bool] = None,
+        rule1_min_trailing_silence: Optional[float] = None,
+        rule2_min_trailing_silence: Optional[float] = None,
+        rule3_min_utterance_length: Optional[float] = None,
         **backend_kwargs,
     ):
         try:
@@ -173,8 +177,38 @@ class SherpaASR(ASRBackend):
                 "model package (see https://github.com/k2-fsa/sherpa-onnx)."
             ) from exc
 
+        # sherpa's factory default for endpoint detection is False, which
+        # silently disables the whole sentence model: stable_chars never grows
+        # and every caption becomes a forced cut. Take the value from the
+        # config unless the caller overrides it explicitly.
+        if enable_endpoint_detection is None:
+            enable_endpoint_detection = bool(
+                getattr(cfg, "enable_endpoint_detection", True))
+        if rule1_min_trailing_silence is None:
+            rule1_min_trailing_silence = float(
+                getattr(cfg, "rule1_min_trailing_silence", 2.4))
+        if rule2_min_trailing_silence is None:
+            rule2_min_trailing_silence = float(
+                getattr(cfg, "rule2_min_trailing_silence", 1.2))
+        if rule3_min_utterance_length is None:
+            rule3_min_utterance_length = float(
+                getattr(cfg, "rule3_min_utterance_length", 20.0))
+
+        # Explicit arguments win over the same keys smuggled through
+        # backend_kwargs, which would otherwise be a duplicate keyword.
+        for name in ("enable_endpoint_detection", "rule1_min_trailing_silence",
+                     "rule2_min_trailing_silence", "rule3_min_utterance_length"):
+            backend_kwargs.pop(name, None)
+
         self.cfg = cfg
         self.sample_rate = int(getattr(cfg, "sample_rate", 16000))
+        self.enable_endpoint_detection = bool(enable_endpoint_detection)
+        self.rule1_min_trailing_silence = float(rule1_min_trailing_silence)
+        self.rule2_min_trailing_silence = float(rule2_min_trailing_silence)
+        self.rule3_min_utterance_length = float(rule3_min_utterance_length)
+        self.endpoint_count = 0
+        self.force_count = 0
+        self.stream_count = 0
         paths = self._resolve_paths(model_dir, tokens, encoder, decoder, joiner)
         self._rec = sherpa_onnx.OnlineRecognizer.from_transducer(
             tokens=paths["tokens"],
@@ -186,6 +220,10 @@ class SherpaASR(ASRBackend):
             feature_dim=80,
             decoding_method=decoding_method,
             provider=provider,
+            enable_endpoint_detection=self.enable_endpoint_detection,
+            rule1_min_trailing_silence=self.rule1_min_trailing_silence,
+            rule2_min_trailing_silence=self.rule2_min_trailing_silence,
+            rule3_min_utterance_length=self.rule3_min_utterance_length,
             **backend_kwargs,
         )
         self.reset()
@@ -227,9 +265,40 @@ class SherpaASR(ASRBackend):
         }
 
     def reset(self) -> None:
-        self._stream = self._rec.create_stream()
         self._session_text = ""
         self._session_words: list = []
+        self.endpoint_count = 0
+        self.force_count = 0
+        self.stream_count = 0
+        self._restart_stream()
+
+    def _restart_stream(self) -> None:
+        """Start a new utterance on a brand-new stream.
+
+        ``OnlineRecognizer.reset()`` keeps the last ``context_size`` tokens as
+        decoder context but does not keep their timestamps: the next result
+        repeats the previous sentence's final words while the token and
+        timestamp lists stop lining up, which silently disables
+        ``_tokens_to_words``. A fresh stream costs only those two context
+        tokens and avoids both problems.
+        """
+        self._stream = self._rec.create_stream()
+        self._stream_origin = None      # set by the first chunk fed to it
+        self.stream_count += 1
+
+    def _absolute(self, words) -> list:
+        """Turn stream-relative word times into absolute audio seconds.
+
+        A fresh stream restarts its timestamps at zero, so every word has to be
+        shifted by the audio time of the first chunk that stream saw. Without
+        this, a segment's t_end could not be taken from its last word.
+        """
+        if not words:
+            return []
+        base = self._stream_origin
+        if base is None:
+            return list(words)
+        return [(w, base + float(t)) for w, t in words]
 
     def _decode(self) -> str:
         while self._rec.is_ready(self._stream):
@@ -270,19 +339,20 @@ class SherpaASR(ASRBackend):
         # The current partial is a separate draft: it is *not* folded into
         # stable via a longest-common-prefix, because a transducer rewrites its
         # tail and that made captions look chopped mid-sentence.
-        if self._rec.is_endpoint(self._stream):
+        if self.enable_endpoint_detection and self._rec.is_endpoint(self._stream):
             if current:
                 self._session_text = _join_text(self._session_text, current)
-                self._session_words = list(self._session_words) + list(cur_words or [])
-            self._rec.reset(self._stream)
+                self._session_words = list(self._session_words) + self._absolute(cur_words)
+            self.endpoint_count += 1
+            self._restart_stream()
             current, cur_words = "", None
         elif finalized and current:
             self._session_text = _join_text(self._session_text, current)
-            self._session_words = list(self._session_words) + list(cur_words or [])
+            self._session_words = list(self._session_words) + self._absolute(cur_words)
             current, cur_words = "", None
 
         text = _join_text(self._session_text, current)
-        words = list(self._session_words) + list(cur_words or [])
+        words = list(self._session_words) + self._absolute(cur_words)
         return ASRUpdate(
             text=text,
             stable_chars=len(self._session_text),
@@ -292,6 +362,8 @@ class SherpaASR(ASRBackend):
         )
 
     def stream(self, samples, start_sec: float, end_sec: float) -> ASRUpdate:
+        if self._stream_origin is None:
+            self._stream_origin = float(start_sec)
         self._stream.accept_waveform(
             self.sample_rate, np.asarray(samples, dtype=np.float32)
         )
@@ -304,11 +376,12 @@ class SherpaASR(ASRBackend):
         """End the current utterance at the current partial, even if sherpa has
         not endpointed. Keeps the bookkeeping inside one place: the text moves
         from draft to session_text, so the segmenter can never see it twice."""
+        self.force_count += 1
         current, cur_words = self._result()
         if current:
             self._session_text = _join_text(self._session_text, current)
-            self._session_words = list(self._session_words) + list(cur_words or [])
-        self._rec.reset(self._stream)
+            self._session_words = list(self._session_words) + self._absolute(cur_words)
+        self._restart_stream()
         text = self._session_text
         return ASRUpdate(text=text, stable_chars=len(text), confidence=1.0,
                          finalized=True, words=self._session_words or None)
