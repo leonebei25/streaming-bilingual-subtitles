@@ -88,19 +88,28 @@ class SubtitlePipeline:
         self._proc0 = time.perf_counter()
         self._realtime = source.realtime
 
-        while True:
-            items = source.take()
-            self._stream_clock = source.released_sec
-            if not items:
-                if source.ended():
+        try:
+            while True:
+                items = source.take()
+                self._stream_clock = source.released_sec
+                if not items:
+                    if source.ended():
+                        break
+                    if source.realtime:
+                        time.sleep(0.004)
+                        continue
                     break
-                if source.realtime:
-                    time.sleep(0.004)
-                    continue
-                break
-            for it in items:
-                self._handle(it)
+                for it in items:
+                    self._handle(it)
+        except KeyboardInterrupt:
+            # Live capture (mic / pipe): Ctrl+C flushes what was produced so far
+            # and lets the caller write its report, instead of losing the run.
+            pass
 
+        # A live stream has no known length up front; its duration is however
+        # much audio actually arrived. Refresh it so metrics divide by the real
+        # span instead of the zero seen at start-up.
+        self.duration_sec = source.duration_sec
         self._finish()
         return self.events
 

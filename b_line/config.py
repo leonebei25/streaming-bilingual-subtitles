@@ -32,9 +32,10 @@ class BLineConfig:
     enable_endpoint_detection: bool = True
     # rule1: trailing silence that ends an utterance even when nothing was
     # decoded (a quiet room). rule2: trailing silence after decoded speech --
-    # the normal trigger. rule3: hard cap on the length of one utterance.
+    # the normal trigger; 2.0 s keeps phrases like "for the | APEC summit"
+    # together instead of cutting at a shallow breath. rule3: hard cap.
     rule1_min_trailing_silence: float = 2.4
-    rule2_min_trailing_silence: float = 1.2
+    rule2_min_trailing_silence: float = 2.0
     rule3_min_utterance_length: float = 20.0
 
     # VAD / endpointing
@@ -83,8 +84,10 @@ class BLineConfig:
     semantic_min_chars: int = 24        # do not bother below this size
 
     # Forced commits back off to a real pause instead of cutting wherever the
-    # draft happens to end. A pause shorter than this is not worth a cut.
-    force_pause_ms: float = 400.0
+    # draft happens to end. 600 ms avoids the shallow ~0.4 s breath that used
+    # to split "working. | President Donald Trump" and pull the next phrase's
+    # first word into the previous caption.
+    force_pause_ms: float = 600.0
     force_min_chars: int = 20           # text that must precede the pause
 
     # Rule-based punctuation, for when no punctuation model is configured: a

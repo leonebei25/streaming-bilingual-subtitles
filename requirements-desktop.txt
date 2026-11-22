@@ -12,6 +12,9 @@ scipy>=1.10
 opencv-python>=4.8
 pillow>=9.5
 
+# Live microphone capture (--mic). Not needed for WAV replay or --pcm-stdin.
+sounddevice>=0.5
+
 # Real streaming ASR (A/B chains). Download a streaming zipformer model
 # separately; the package is only the runtime.
 sherpa-onnx>=1.10,<3

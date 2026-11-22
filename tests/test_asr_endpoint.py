@@ -109,7 +109,7 @@ class TestEndpointWiring(unittest.TestCase):
         _, rec = self._make()
         self.assertTrue(rec.kwargs["enable_endpoint_detection"])
         self.assertAlmostEqual(rec.kwargs["rule1_min_trailing_silence"], 2.4)
-        self.assertAlmostEqual(rec.kwargs["rule2_min_trailing_silence"], 1.2)
+        self.assertAlmostEqual(rec.kwargs["rule2_min_trailing_silence"], 2.0)
         self.assertAlmostEqual(rec.kwargs["rule3_min_utterance_length"], 20.0)
 
     def test_endpoint_can_be_disabled(self):

@@ -83,11 +83,26 @@ A-line, which owns capture and format normalisation.
     # 5. desktop A/B smoke: link -> enhancement -> ASR -> MT -> events -> MP4
     python scripts/desktop_smoke.py --synth
 
-    # 6. real ASR + real MT on a WAV
-    python run_pipeline.py --wav in.wav --script script.json \
-        --asr sherpa --asr-model-dir models/sherpa-en \
+    # 6. real ASR + real MT on a WAV. With --asr-model-dir omitted it uses the
+    #    Kroko 2025 English model under models/ when present (recommended), else
+    #    the legacy 2023 model.
+    python run_pipeline.py --wav in.wav \
+        --asr sherpa \
         --mt opus --enhance spectral --link --link-loss 0.05 \
         --video-out out.mp4 --out run.json
+
+    # 7. live microphone input (native streaming: audio is consumed hop by hop as
+    #    it arrives, never preloaded). Needs `pip install sounddevice`.
+    python run_pipeline.py --mic-list                 # find a device index
+    python run_pipeline.py --mic --asr sherpa --max-seconds 60 --out runs/mic.json
+
+    # 7b. same live input, but with the on-screen caption window. No --video:
+    #     play a video in any external player and let the mic/loopback hear it.
+    python scripts/live_demo.py --mic --mt opus --mt-model models/opus-mt-en-zh
+
+    # 8. live PCM over stdin (16 kHz mono signed-16 little-endian), e.g. a pipe
+    #    or socket feed. Same streaming contract as --mic.
+    some-feed | python run_pipeline.py --pcm-stdin --asr sherpa --max-seconds 60
 
 ## Converting audio to 16 kHz
 
@@ -222,10 +237,21 @@ Stubbed (fail loudly until configured), or not implemented yet:
     and ONNX wrapper are the next piece of work.
   * MicFrameSource — needs a 16 kHz mono capture device (sounddevice).
 
-Desktop dependencies are in `requirements-desktop.txt`. The sherpa model is a
-separate download (e.g. `sherpa-onnx-streaming-zipformer-en-2023-06-26`) and the
-MarianMT weights are fetched by `transformers` or supplied as a local directory
-for offline use.
+Desktop dependencies are in `requirements-desktop.txt`. The ASR model is a
+separate download; the recommended streaming English model is the Kroko 2025
+package (much stronger on real broadcast/news audio than the LibriSpeech-trained
+2023 one, and still real-time):
+
+    HF_ENDPOINT=https://hf-mirror.com huggingface-cli download \
+        csukuangfj/sherpa-onnx-streaming-zipformer-en-kroko-2025-08-06 \
+        --local-dir models/sherpa-onnx-streaming-zipformer-en-kroko-2025-08-06
+
+When `--asr-model-dir` is omitted, `run_pipeline.py` and `scripts/live_demo.py`
+pick that directory automatically (falling back to
+`sherpa-onnx-streaming-zipformer-en-2023-06-26` if only that is present).
+`--decoding-method modified_beam_search` trades latency for accuracy when
+evaluating. The MarianMT weights are fetched by `transformers` or supplied as a
+local directory for offline use.
 
 A punctuation model is optional. `--punct-model` accepts an extracted directory
 or a single `.onnx` file: a directory containing `bpe.vocab` is the online
