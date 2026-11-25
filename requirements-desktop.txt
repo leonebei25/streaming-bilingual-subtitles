@@ -20,8 +20,14 @@ sounddevice>=0.5
 sherpa-onnx>=1.10,<3
 
 # Real translation backend (OpusMT / MarianMT). sentencepiece is required by
-# the Marian tokenizer. Skip these two lines if you only use IdentityMT.
+# the Marian tokenizer. torch is used by the OpusMT backend and by the one-off
+# CTranslate2 conversion; skip this block if you only use IdentityMT.
 transformers>=4.40
 sentencepiece>=0.1.99
 sacremoses>=0.1.1
 torch>=2.2
+
+# CTranslate2: the Jetson / low-footprint MT backend. After converting once
+# with scripts/convert_mt_ct2.py, inference needs ctranslate2 + transformers +
+# sentencepiece only -- no torch. Wheels exist for aarch64.
+ctranslate2>=4.0

@@ -6,6 +6,7 @@ the audio enhancement.
 """
 from __future__ import annotations
 
+import math
 import os
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -135,6 +136,120 @@ class OpusMT(MTBackend):
                     self._torch.exp(scores[0]).clamp(0.0, 1.0).item()
                 )
             except Exception:
+                confidence = 1.0
+        return zh, confidence
+
+
+class CT2MT(MTBackend):
+    """Opus/Marian MT served by CTranslate2 (CPU int8 by default).
+
+    The Marian weights are converted once to the CTranslate2 format with
+    ``scripts/convert_mt_ct2.py``. That directory is portable, so the model is
+    quantised on the desktop and copied to the Jetson unchanged. At inference
+    time only ``ctranslate2`` and the tokenizer half of ``transformers`` are
+    imported -- torch stays out of the hot path, which is the whole point of
+    the Jetson deployment.
+
+    ``beam_size`` 4 matches OpusMT's default. ``intra_threads=0`` lets
+    CTranslate2 pick a thread count; on the Orin Nano set it to the number of
+    physical cores (6) if the pipeline competes with ASR.
+    """
+
+    def __init__(
+        self,
+        model_dir: str = "models/opus-mt-en-zh-ct2",
+        device: str = "cpu",
+        compute_type: str = "int8",
+        beam_size: int = 4,
+        max_decoding_length: int = 256,
+        use_context: bool = False,
+        intra_threads: int = 0,
+        inter_threads: int = 1,
+        tokenizer_dir: Optional[str] = None,
+    ):
+        try:
+            import ctranslate2
+            from transformers import MarianTokenizer
+        except ImportError as exc:  # pragma: no cover - depends on the machine
+            raise RuntimeError(
+                "CT2MT needs ctranslate2 and transformers (tokenizer only). "
+                "Install with `pip install ctranslate2 transformers sentencepiece`; "
+                "torch is not required at inference time."
+            ) from exc
+
+        path = Path(model_dir)
+        if not path.is_dir():
+            raise RuntimeError(
+                f"no CTranslate2 model directory at {model_dir!r}.\n"
+                "Convert the Marian/Opus checkpoint once (on the desktop; the "
+                "result is portable to the Jetson):\n"
+                "  pip install ctranslate2 transformers sentencepiece torch\n"
+                "  python scripts/convert_mt_ct2.py --model models/opus-mt-en-zh "
+                "--out models/opus-mt-en-zh-ct2\n"
+                "Then point the pipeline at it with --mt ct2 --mt-model <dir>."
+            )
+
+        try:
+            self._tokenizer = MarianTokenizer.from_pretrained(
+                str(tokenizer_dir or model_dir), local_files_only=True
+            )
+        except Exception as exc:  # pragma: no cover - depends on the model dir
+            raise RuntimeError(
+                f"the CTranslate2 model at {model_dir!r} has no usable tokenizer "
+                f"({exc}). Re-run the conversion with the tokenizer files copied "
+                "(--copy-files tokenizer_config.json,vocab.json,source.spm,"
+                "target.spm), or pass --mt-tokenizer-dir pointing at the original "
+                "Hugging Face directory."
+            ) from exc
+
+        self.model_dir = str(model_dir)
+        self.device = device or "cpu"
+        self.compute_type = compute_type or "int8"
+        self.beam_size = max(1, int(beam_size))
+        self.max_decoding_length = int(max_decoding_length)
+        self.use_context = bool(use_context)
+        self.intra_threads = max(0, int(intra_threads))
+        self.inter_threads = max(1, int(inter_threads))
+        self._translator = ctranslate2.Translator(
+            self.model_dir,
+            device=self.device,
+            compute_type=self.compute_type,
+            inter_threads=self.inter_threads,
+            intra_threads=self.intra_threads,
+        )
+
+    def translate(self, text_en: str, context: Sequence[str] = ()) -> Tuple[str, float]:
+        text = (text_en or "").strip()
+        if not text:
+            return "", 1.0
+        if self.use_context and context:
+            previous = (context[-1] or "").strip()
+            if previous:
+                text = f"{previous} {text}"
+
+        token_ids = self._tokenizer.encode(text)
+        source_tokens = self._tokenizer.convert_ids_to_tokens(token_ids)
+        results = self._translator.translate_batch(
+            [source_tokens],
+            beam_size=self.beam_size,
+            max_decoding_length=self.max_decoding_length,
+        )
+        if not results or not results[0].hypotheses:
+            return "", 0.0
+
+        target_tokens = results[0].hypotheses[0]
+        zh = self._tokenizer.decode(
+            self._tokenizer.convert_tokens_to_ids(target_tokens),
+            skip_special_tokens=True,
+        ).strip()
+
+        confidence = 1.0
+        scores = getattr(results[0], "scores", None)
+        if scores:
+            try:
+                # scores are cumulative log probabilities of the hypotheses.
+                confidence = math.exp(min(0.0, float(scores[0])))
+            except (TypeError, ValueError, OverflowError):
                 confidence = 1.0
         return zh, confidence
 
