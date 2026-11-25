@@ -1,0 +1,6 @@
+# Shell launchers must keep LF endings even on a Windows checkout, or the
+# Jetson refuses to run them ("bad interpreter: /usr/bin/env bash^M").
+*.sh text eol=lf
+
+# Windows batch files want CRLF.
+*.bat text eol=crlf

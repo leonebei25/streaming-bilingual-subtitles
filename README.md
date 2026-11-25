@@ -19,7 +19,8 @@ real-time branch must not access audio that has not yet arrived.
       sentence.py    sentence splitting (punctuation, discourse markers, cap)
       punct.py       optional punctuation restoration (sherpa-onnx online
                      CNN-BiLSTM, or offline zh+en CT-Transformer)
-      mt.py          MT protocol, IdentityMT (mock), OpusMT (real), PretrainedMT (stub)
+      mt.py          MT protocol, IdentityMT (mock), OpusMT (torch), CT2MT
+                     (CTranslate2 int8, the Jetson path), PretrainedMT (stub)
       metrics.py     WER, chrF, timing error, RTF, latency percentiles
       manifest.py    60/20/20 data split by speaker/source
       pipeline.py    orchestration: source -> VAD -> ASR -> segmenter -> MT -> events
@@ -100,8 +101,23 @@ A-line, which owns capture and format normalisation.
     #     play a video in any external player and let the mic/loopback hear it.
     python scripts/live_demo.py --mic --mt opus --mt-model models/opus-mt-en-zh
 
+    # 7c. deployment backend: Opus MT converted to CTranslate2 int8. No torch
+    #     at inference time; this is what runs on the Jetson. Convert once:
+    python scripts/convert_mt_ct2.py --model models/opus-mt-en-zh \
+        --out models/opus-mt-en-zh-ct2
+    python scripts/live_demo.py --mic --mt ct2 --mt-model models/opus-mt-en-zh-ct2
+    python scripts/check_mt.py --backend ct2 --threads 6   # load + ms/sentence
+
+    # 7d. Linux / Jetson launcher: run_mic.sh wraps the venv, the display
+    #     check and PulseAudio loopback. MT=auto uses ct2 when converted.
+    ./run_mic.sh                        # microphone
+    ./run_mic.sh monitor                # capture what the machine plays
+    ./run_mic.sh devices                # PortAudio inputs + pactl sources
+    MT=ct2 ./run_mic.sh monitor         # deployment backend, system audio
+
     # 8. live PCM over stdin (16 kHz mono signed-16 little-endian), e.g. a pipe
-    #    or socket feed. Same streaming contract as --mic.
+    #    or socket feed. Same streaming contract as --mic. run_mic.sh monitor
+    #    is exactly this: parec --format=s16le --rate=16000 | live_demo.
     some-feed | python run_pipeline.py --pcm-stdin --asr sherpa --max-seconds 60
 
 ## Converting audio to 16 kHz
@@ -225,7 +241,7 @@ The transcript JSON used by the mock recognizer looks like:
 
 Real: sources, VAD, segmentation, orchestration, metrics, manifest, CLI, link
 simulation, spectral/Wiener enhancement, subtitle video rendering, SherpaASR,
-OpusMT.
+OpusMT, CT2MT.
 
 Stubbed (fail loudly until configured), or not implemented yet:
   * Qwen3ASR — needs the qwen-asr package + a vLLM backend. Note that Qwen3-ASR
@@ -252,6 +268,15 @@ pick that directory automatically (falling back to
 `--decoding-method modified_beam_search` trades latency for accuracy when
 evaluating. The MarianMT weights are fetched by `transformers` or supplied as a
 local directory for offline use.
+
+There are two interchangeable backends for the same Marian checkpoint.
+`--mt opus` runs it through torch (the desktop baseline). `--mt ct2` runs a
+CTranslate2 conversion: `scripts/convert_mt_ct2.py` writes a portable directory
+(int8 by default, roughly a quarter of the size) and inference then needs only
+`ctranslate2` plus the Marian tokenizer -- no torch and no CUDA build. That is
+the Jetson deployment path. `--mt auto` prefers `models/opus-mt-en-zh-ct2` when
+it exists, then `models/opus-mt-en-zh`. Latency and quality differences between
+the two are measured with `scripts/check_mt.py --backend ct2|opus`.
 
 A punctuation model is optional. `--punct-model` accepts an extracted directory
 or a single `.onnx` file: a directory containing `bpe.vocab` is the online
