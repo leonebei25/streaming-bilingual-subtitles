@@ -30,7 +30,7 @@ from a_line.video import make_test_video, render_subtitles
 from b_line.asr import ScriptedASR, SherpaASR, default_model_dir
 from b_line.config import BLineConfig
 from b_line.metrics import evaluate
-from b_line.mt import IdentityMT, OpusMT
+from b_line.mt import CT2MT, IdentityMT, OpusMT
 from b_line.pipeline import SubtitlePipeline
 from b_line.sources import (
     MicFrameSource,
@@ -212,14 +212,28 @@ def build_asr(args, cfg: BLineConfig, entries):
     raise SystemExit(f"unknown ASR backend: {args.asr}")
 
 
+def _default_ct2_dir() -> str:
+    return str(Path(__file__).resolve().parent / "models" / "opus-mt-en-zh-ct2")
+
+
 def build_mt(args):
     if args.mt == "identity":
         return IdentityMT()
+    if args.mt == "ct2":
+        return CT2MT(
+            model_dir=args.mt_model or _default_ct2_dir(),
+            device=args.mt_device or "cpu",
+            compute_type=args.mt_compute_type,
+            beam_size=args.mt_beams,
+            intra_threads=args.mt_threads,
+            use_context=args.mt_context,
+        )
     if args.mt == "opus":
         return OpusMT(
-            model_name=args.mt_model,
+            model_name=args.mt_model or "Helsinki-NLP/opus-mt-en-zh",
             device=args.mt_device,
             use_context=args.mt_context,
+            num_beams=args.mt_beams,
         )
     raise SystemExit(f"unknown MT backend: {args.mt}")
 
@@ -307,9 +321,18 @@ def main(argv=None):
     ap.add_argument("--rule3-sec", type=float, default=20.0,
                     help="endpoint rule3: hard cap on one utterance (default 20 s)")
 
-    ap.add_argument("--mt", choices=["identity", "opus"], default="identity")
-    ap.add_argument("--mt-model", default="Helsinki-NLP/opus-mt-en-zh")
+    ap.add_argument("--mt", choices=["identity", "ct2", "opus"], default="identity")
+    ap.add_argument("--mt-model", default=None,
+                    help="model directory; the default depends on --mt "
+                         "(models/opus-mt-en-zh-ct2 for ct2, "
+                         "Helsinki-NLP/opus-mt-en-zh for opus)")
     ap.add_argument("--mt-device", default=None)
+    ap.add_argument("--mt-compute-type", default="int8",
+                    help="ct2 weights (default: int8)")
+    ap.add_argument("--mt-threads", type=int, default=0,
+                    help="ct2 intra-op threads (0 = auto; 4-6 on the Orin Nano)")
+    ap.add_argument("--mt-beams", type=int, default=4,
+                    help="beam size for both backends (default 4)")
     ap.add_argument("--mt-context", action="store_true")
     ap.add_argument("--punct-model", default="",
                     help="punctuation model: a directory or a .onnx file. A dir "
@@ -345,6 +368,12 @@ def main(argv=None):
         asr_snapshot = "sherpa:" + Path(args.asr_model_dir or "?").name
     else:
         asr_snapshot = "scripted"
+    if args.mt == "ct2":
+        mt_snapshot = "ct2:" + Path(args.mt_model or _default_ct2_dir()).name
+    elif args.mt == "opus":
+        mt_snapshot = args.mt_model or "Helsinki-NLP/opus-mt-en-zh"
+    else:
+        mt_snapshot = "identity"
     cfg = BLineConfig(
         chunk_ms=args.chunk_ms,
         stability_delay_ms=args.stability_ms,
@@ -364,7 +393,7 @@ def main(argv=None):
         rule2_min_trailing_silence=args.rule2_ms / 1000.0,
         rule3_min_utterance_length=args.rule3_sec,
         asr_model=asr_snapshot,
-        mt_model=args.mt_model if args.mt == "opus" else "identity",
+        mt_model=mt_snapshot,
     )
 
     loss = parse_loss(args.loss)
@@ -396,7 +425,10 @@ def main(argv=None):
               f"rule1={cfg.rule1_min_trailing_silence * 1000:.0f}ms",
               f"rule2={cfg.rule2_min_trailing_silence * 1000:.0f}ms",
               f"rule3={cfg.rule3_min_utterance_length:.0f}s")
-    mt = build_mt(args)
+    try:
+        mt = build_mt(args)
+    except Exception as exc:
+        raise SystemExit(f"cannot build MT backend {args.mt!r}: {exc}")
     punct = None
     if args.punct_model:
         from b_line.punct import PunctRestorer

@@ -52,7 +52,7 @@ from a_line.video import find_cjk_font
 from b_line.asr import ScriptedASR, SherpaASR, default_model_dir
 from b_line.config import BLineConfig
 from b_line.display import CJK_CPS, LATIN_CPS, CaptionQueue
-from b_line.mt import IdentityMT, OpusMT
+from b_line.mt import CT2MT, IdentityMT, OpusMT
 from b_line.pipeline import SubtitlePipeline
 from b_line.sources import MicFrameSource, PcmStreamSource, WavFrameSource
 
@@ -231,16 +231,23 @@ def build_parser():
     ap.add_argument("--rule3-sec", type=float, default=20.0,
                     help="endpoint rule3: hard cap on one utterance (default 20 s)")
 
-    ap.add_argument("--mt", choices=["auto", "none", "identity", "opus"],
+    ap.add_argument("--mt", choices=["auto", "none", "identity", "ct2", "opus"],
                     default="auto",
-                    help="auto (default) = opus when models/opus-mt-en-zh exists, "
+                    help="auto (default) = ct2 when models/opus-mt-en-zh-ct2 "
+                         "exists, else opus when models/opus-mt-en-zh exists, "
                          "else English-only; none = English-only; identity = no "
                          "translation text")
     ap.add_argument("--mt-model", default=None,
-                    help="local model directory or hub id (default: "
-                         "models/opus-mt-en-zh when present, else "
-                         "Helsinki-NLP/opus-mt-en-zh)")
-    ap.add_argument("--mt-device", default=None)
+                    help="model directory (default: models/opus-mt-en-zh-ct2 "
+                         "for ct2, models/opus-mt-en-zh for opus)")
+    ap.add_argument("--mt-device", default=None, help="cpu (default) or cuda")
+    ap.add_argument("--mt-compute-type", default="int8",
+                    help="ct2 weights (default: int8); float32 costs speed but "
+                         "recovers a little accuracy")
+    ap.add_argument("--mt-threads", type=int, default=0,
+                    help="ct2 intra-op threads (0 = auto; 4-6 on the Orin Nano)")
+    ap.add_argument("--mt-beams", type=int, default=4,
+                    help="beam size for both backends (default 4)")
     ap.add_argument("--mt-context", action="store_true")
     ap.add_argument("--punct-model", default="",
                     help="punctuation model: a directory or a .onnx file. A dir "
@@ -757,18 +764,30 @@ def _local_mt_dir() -> Path:
     return Path(__file__).resolve().parent.parent / "models" / "opus-mt-en-zh"
 
 
+def _local_ct2_dir() -> Path:
+    """models/opus-mt-en-zh-ct2: the converted model the Jetson runs."""
+    return Path(__file__).resolve().parent.parent / "models" / "opus-mt-en-zh-ct2"
+
+
 def build_mt(args):
     choice = args.mt
     model = args.mt_model
 
     if choice == "auto":
+        ct2_dir = _local_ct2_dir()
         local = _local_mt_dir()
-        if model or local.is_dir():
-            choice = "opus"
-            model = model or str(local)
+        if model:
+            # An explicit directory tells us which format it is: CTranslate2
+            # writes model.bin, Hugging Face writes config.json.
+            choice = "ct2" if (Path(model) / "model.bin").is_file() else "opus"
+        elif ct2_dir.is_dir():
+            choice, model = "ct2", str(ct2_dir)
+        elif local.is_dir():
+            choice, model = "opus", str(local)
         else:
-            print("translation: off -- no local model at models/opus-mt-en-zh; "
-                  "the Chinese line needs --mt opus --mt-model <dir>")
+            print("translation: off -- no local MT model at "
+                  "models/opus-mt-en-zh-ct2 or models/opus-mt-en-zh; "
+                  "the Chinese line needs --mt ct2 --mt-model <dir>")
             return NullMT()
 
     if choice == "none":
@@ -778,12 +797,32 @@ def build_mt(args):
         print("translation: identity -- no Chinese text will be produced")
         return IdentityMT()
 
+    if choice == "ct2":
+        model = model or str(_local_ct2_dir())
+        try:
+            mt = CT2MT(
+                model_dir=model,
+                device=args.mt_device or "cpu",
+                compute_type=args.mt_compute_type,
+                beam_size=args.mt_beams,
+                intra_threads=args.mt_threads,
+                use_context=args.mt_context,
+            )
+        except Exception as exc:
+            print(f"translation: off -- CT2MT could not load ({exc}). "
+                  "The transcript will be English-only.")
+            return NullMT()
+        print(f"translation: ct2 {model} on {mt.device} "
+              f"({mt.compute_type}, beam={mt.beam_size}); torch not used")
+        return mt
+
     model = model or "Helsinki-NLP/opus-mt-en-zh"
     try:
         mt = OpusMT(
             model_name=model,
             device=args.mt_device,
             use_context=args.mt_context,
+            num_beams=args.mt_beams,
         )
     except Exception as exc:
         print(f"translation: off -- OpusMT could not load ({exc}). "
@@ -795,7 +834,7 @@ def build_mt(args):
           "line gets its Chinese translation underneath")
     if device == "cpu":
         print("  note: translating on CPU blocks the pipeline for the length of "
-              "each sentence; use --mt-device cuda when torch has CUDA")
+              "each sentence; use --mt ct2 (int8, no torch) or --mt-device cuda")
     return mt
 
 
